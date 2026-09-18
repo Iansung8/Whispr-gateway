@@ -1,0 +1,18 @@
+# live state (created on first run from gateway.config.default.json)
+gateway.config.json
+gateway.log*
+
+# large / third-party files are never committed - see README "相依項目"
+models/*.bin
+engine/
+runtime/
+
+# build output: publish the exe as a GitHub Release asset, not in the tree
+*.exe
+
+# generated test audio (tools\test-model.ps1 and tools\make-test-clip2.ps1 recreate them)
+tools/*.wav
+tools/*.webm
+
+# personal notes
+private/

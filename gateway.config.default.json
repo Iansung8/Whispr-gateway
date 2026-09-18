@@ -1,0 +1,17 @@
+{
+  "port": 8790,
+  "backendPort": 8791,
+  "listen": "auto",
+  "remoteInterfaces": "",
+  "allowCidrs": "auto",
+  "allowRemote": false,
+  "idleMinutes": 15,
+  "device": "gpu:0",
+  "punctuation": true,
+  "language": "zh",
+  "prompt": "以下是繁體中文的句子，有逗號、句號等標點符號。",
+  "modelsDir": "models",
+  "modelFile": "ggml-breeze-asr-25-q8_0.bin",
+  "engineDir": "engine",
+  "tmpDir": "%TEMP%\\whispr-gateway-tmp"
+}
