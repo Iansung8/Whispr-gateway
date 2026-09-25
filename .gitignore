@@ -16,3 +16,6 @@ tools/*.webm
 
 # personal notes
 private/
+
+# OpenCC dictionaries, fetched on first use (Apache-2.0)
+data/

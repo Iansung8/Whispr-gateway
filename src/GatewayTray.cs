@@ -13,6 +13,7 @@ using System.Net;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Web.Script.Serialization;
 using System.Windows.Forms;
@@ -70,28 +71,99 @@ namespace WhisprGateway
         }
     }
 
-    // "Start with Windows" = a per-user Run entry, so it follows the user's logon and needs no admin.
+    // "Start with Windows" = a per-user Task Scheduler task with a logon trigger (no admin needed).
+    // It replaced an HKCU Run entry: on the development machine Explorer ran every other Run entry at
+    // logon but silently skipped this one, and a Run entry cannot be test-fired. A task can
+    // (`schtasks /Run /TN WhisprGateway`), gets a short delay so the VPN adapter and GPU driver are
+    // up, and is re-registered automatically when the folder has moved.
     static class Autostart
     {
-        const string RunKey = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
-        const string ValueName = "WhisprGateway";
+        const string TaskName = "WhisprGateway";
+        const string LegacyRunKey = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 
-        public static bool IsEnabled()
+        static int Schtasks(string args, out string output)
         {
-            using (RegistryKey key = Registry.CurrentUser.OpenSubKey(RunKey, false))
+            ProcessStartInfo psi = new ProcessStartInfo("schtasks.exe", args);
+            psi.UseShellExecute = false;
+            psi.CreateNoWindow = true;
+            psi.RedirectStandardOutput = true;
+            psi.RedirectStandardError = true;
+            using (Process p = Process.Start(psi))
             {
-                string value = key == null ? null : key.GetValue(ValueName) as string;
-                return value != null && value.IndexOf(Application.ExecutablePath, StringComparison.OrdinalIgnoreCase) >= 0;
+                output = p.StandardOutput.ReadToEnd() + p.StandardError.ReadToEnd();
+                p.WaitForExit(15000);
+                return p.ExitCode;
             }
         }
 
-        public static void Set(bool enabled)
+        static bool TaskExists(out bool pointsHere)
         {
-            using (RegistryKey key = Registry.CurrentUser.CreateSubKey(RunKey))
+            string xml;
+            pointsHere = false;
+            if (Schtasks("/Query /TN \"" + TaskName + "\" /XML", out xml) != 0) return false;
+            pointsHere = xml.IndexOf(System.Security.SecurityElement.Escape(Application.ExecutablePath), StringComparison.OrdinalIgnoreCase) >= 0;
+            return true;
+        }
+
+        public static bool IsEnabled()
+        {
+            bool pointsHere;
+            return TaskExists(out pointsHere);
+        }
+
+        public static bool Set(bool enabled)
+        {
+            RemoveLegacyRunEntry();
+            string output;
+            if (!enabled) return Schtasks("/Delete /TN \"" + TaskName + "\" /F", out output) == 0;
+
+            string user = System.Security.Principal.WindowsIdentity.GetCurrent().Name;
+            string exe = Application.ExecutablePath;
+            Func<string, string> esc = System.Security.SecurityElement.Escape;
+            string xml =
+                "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\r\n" +
+                "<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\r\n" +
+                "  <RegistrationInfo><Description>Starts the WhisprGateway tray app (on-demand speech-to-text gateway for OpenWhispr) at logon.</Description></RegistrationInfo>\r\n" +
+                "  <Triggers><LogonTrigger><Enabled>true</Enabled><UserId>" + esc(user) + "</UserId><Delay>PT20S</Delay></LogonTrigger></Triggers>\r\n" +
+                "  <Principals><Principal id=\"Author\"><UserId>" + esc(user) + "</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>\r\n" +
+                "  <Settings>\r\n" +
+                "    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\r\n" +
+                "    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\r\n" +
+                "    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\r\n" +
+                "    <StartWhenAvailable>true</StartWhenAvailable>\r\n" +
+                "    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>\r\n" +
+                "    <Enabled>true</Enabled>\r\n" +
+                "  </Settings>\r\n" +
+                "  <Actions Context=\"Author\"><Exec><Command>" + esc(exe) + "</Command><Arguments>--autostart</Arguments><WorkingDirectory>" + esc(Path.GetDirectoryName(exe)) + "</WorkingDirectory></Exec></Actions>\r\n" +
+                "</Task>\r\n";
+            string tmp = Path.Combine(Path.GetTempPath(), "whisprgateway-task.xml");
+            File.WriteAllText(tmp, xml, Encoding.Unicode); // UTF-16 with BOM, as the declaration says
+            try { return Schtasks("/Create /TN \"" + TaskName + "\" /XML \"" + tmp + "\" /F", out output) == 0; }
+            finally { try { File.Delete(tmp); } catch { } }
+        }
+
+        // Called at startup: move an old Run entry over to the task, and re-point the task after the
+        // folder has been moved.
+        public static void Repair()
+        {
+            bool pointsHere;
+            bool exists = TaskExists(out pointsHere);
+            if (RemoveLegacyRunEntry() && !exists) { Set(true); return; }
+            if (exists && !pointsHere) Set(true);
+        }
+
+        static bool RemoveLegacyRunEntry()
+        {
+            try
             {
-                if (enabled) key.SetValue(ValueName, "\"" + Application.ExecutablePath + "\" --autostart");
-                else key.DeleteValue(ValueName, false);
+                using (RegistryKey key = Registry.CurrentUser.OpenSubKey(LegacyRunKey, true))
+                {
+                    if (key == null || key.GetValue(TaskName) == null) return false;
+                    key.DeleteValue(TaskName, false);
+                    return true;
+                }
             }
+            catch { return false; }
         }
     }
 
@@ -110,7 +182,7 @@ namespace WhisprGateway
         readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer();
         readonly Dictionary<string, Icon> icons = new Dictionary<string, Icon>();
 
-        ToolStripMenuItem miStatus, miDetail, miProblem, miLoad, miUnload, miIdle, miModel, miDevice, miPunct, miRemote, miAutostart;
+        ToolStripMenuItem miStatus, miDetail, miProblem, miLoad, miUnload, miIdle, miModel, miDevice, miPunct, miConvert, miRemote, miAutostart;
         readonly int[] idleChoices = new int[] { 5, 15, 30, 60, 0 };
 
         Process nodeProc;
@@ -118,6 +190,7 @@ namespace WhisprGateway
         DateTime restartNotBefore = DateTime.MinValue;
         bool exitHandled = true;
         bool quitting;
+        volatile bool autostartOn; // cached: asking Task Scheduler takes a few hundred ms
         Dictionary<string, object> lastStatus;
         InfoForm infoForm;
 
@@ -155,6 +228,12 @@ namespace WhisprGateway
             };
             notify.BalloonTipClicked += delegate { ShowInfo(); };
 
+            // Off the UI thread: migrate an old Run entry / re-point a moved folder, then read the state.
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                try { Autostart.Repair(); autostartOn = Autostart.IsEnabled(); } catch { }
+            });
+
             timer.Interval = 3000;
             timer.Tick += delegate { Tick(); };
             timer.Start();
@@ -179,10 +258,16 @@ namespace WhisprGateway
                 if (File.Exists(readme)) Process.Start("notepad.exe", "\"" + readme + "\"");
             };
             miDevice = new ToolStripMenuItem("運算裝置");
-            miPunct = new ToolStripMenuItem("自動補標點（依停頓切句）");
+            miPunct = new ToolStripMenuItem("自動補標點（依停頓切句，whisper 模型）");
             miPunct.Click += delegate
             {
                 Call("POST", "/control/punctuation?enabled=" + (miPunct.Checked ? "false" : "true"));
+                Refresh();
+            };
+            miConvert = new ToolStripMenuItem("簡體輸出轉台灣繁體（Qwen3-ASR 系列）");
+            miConvert.Click += delegate
+            {
+                Call("POST", "/control/convert?enabled=" + (miConvert.Checked ? "false" : "true"));
                 Refresh();
             };
             miLoad = new ToolStripMenuItem("立即載入模型（佔用 GPU）");
@@ -215,7 +300,12 @@ namespace WhisprGateway
                 Call("POST", "/control/remote?enabled=" + (miRemote.Checked ? "false" : "true"));
                 Refresh();
             };
-            miAutostart.Click += delegate { Autostart.Set(!Autostart.IsEnabled()); };
+            miAutostart.Click += delegate
+            {
+                bool target = !autostartOn;
+                if (Autostart.Set(target)) autostartOn = target;
+                else notify.ShowBalloonTip(6000, "語音辨識閘道", "無法變更自動啟動設定（工作排程器拒絕）。", ToolTipIcon.Warning);
+            };
             miInfo.Click += delegate { ShowInfo(); };
             miLog.Click += delegate { if (File.Exists(logFile)) Process.Start("notepad.exe", "\"" + logFile + "\""); };
             miRestart.Click += delegate { StopGateway(); restartNotBefore = DateTime.MinValue; StartGateway(); };
@@ -231,10 +321,10 @@ namespace WhisprGateway
             menu.Items.AddRange(new ToolStripItem[] {
                 miStatus, miDetail, miProblem, new ToolStripSeparator(),
                 miLoad, miUnload, new ToolStripSeparator(),
-                miIdle, miModel, miDevice, miPunct, miRemote, new ToolStripSeparator(),
+                miIdle, miModel, miDevice, miPunct, miConvert, miRemote, new ToolStripSeparator(),
                 miInfo, miAutostart, new ToolStripSeparator(),
                 miLog, miRestart, miQuit });
-            menu.Opening += delegate { Refresh(); RebuildModelMenu(); RebuildDeviceMenu(); miAutostart.Checked = Autostart.IsEnabled(); };
+            menu.Opening += delegate { Refresh(); RebuildModelMenu(); RebuildDeviceMenu(); miAutostart.Checked = autostartOn; };
         }
 
         // Devices come from the gateway: NVIDIA GPUs (CUDA engine), Vulkan if that engine is installed, CPU.
@@ -277,11 +367,16 @@ namespace WhisprGateway
             string current = lastStatus != null && lastStatus.ContainsKey("modelFile") ? Convert.ToString(lastStatus["modelFile"]) : "";
             if (Directory.Exists(modelsDir))
             {
-                foreach (string file in Directory.GetFiles(modelsDir, "*.bin"))
+                // *.bin = whisper.cpp models; *.gguf = Qwen3-ASR family (their mmproj-*.gguf audio encoders are not models)
+                List<string> files = new List<string>(Directory.GetFiles(modelsDir, "*.bin"));
+                foreach (string gguf in Directory.GetFiles(modelsDir, "*.gguf"))
+                    if (!Regex.IsMatch(Path.GetFileName(gguf), "(^mmproj-|[.-]mmproj[-.])", RegexOptions.IgnoreCase)) files.Add(gguf);
+                foreach (string file in files)
                 {
                     string name = Path.GetFileName(file);
                     double gb = new FileInfo(file).Length / 1073741824.0;
-                    ToolStripMenuItem item = new ToolStripMenuItem(name + "  (" + gb.ToString("0.0") + " GB)");
+                    string engine = name.EndsWith(".gguf", StringComparison.OrdinalIgnoreCase) ? "llama.cpp" : "whisper.cpp";
+                    ToolStripMenuItem item = new ToolStripMenuItem(name + "  (" + gb.ToString("0.0") + " GB · " + engine + ")");
                     item.Tag = name;
                     item.Checked = string.Equals(name, current, StringComparison.OrdinalIgnoreCase);
                     item.Click += delegate(object s, EventArgs e)
@@ -293,7 +388,7 @@ namespace WhisprGateway
                 }
             }
             if (miModel.DropDownItems.Count > 0) miModel.DropDownItems.Add(new ToolStripSeparator());
-            ToolStripMenuItem open = new ToolStripMenuItem("開啟模型資料夾（放入新的 ggml .bin 即可切換）");
+            ToolStripMenuItem open = new ToolStripMenuItem("開啟模型資料夾（放入 ggml .bin，或 GGUF＋mmproj，即可切換）");
             open.Click += delegate { Directory.CreateDirectory(modelsDir); Process.Start("explorer.exe", "\"" + modelsDir + "\""); };
             miModel.DropDownItems.Add(open);
         }
@@ -326,7 +421,7 @@ namespace WhisprGateway
                 miStatus.Text = "狀態：閘道未回應";
                 miDetail.Text = " ";
                 miProblem.Visible = false;
-                miLoad.Enabled = miUnload.Enabled = miIdle.Enabled = miModel.Enabled = miDevice.Enabled = miPunct.Enabled = miRemote.Enabled = false;
+                miLoad.Enabled = miUnload.Enabled = miIdle.Enabled = miModel.Enabled = miDevice.Enabled = miPunct.Enabled = miConvert.Enabled = miRemote.Enabled = false;
                 return;
             }
 
@@ -351,7 +446,8 @@ namespace WhisprGateway
             SetTip("語音辨識閘道：" + label);
             miStatus.Text = "狀態：" + label;
 
-            string detail = idle > 0 ? "閒置 " + idle + " 分鐘自動卸載" : "不自動卸載";
+            string engineName = lastStatus.ContainsKey("engine") && Convert.ToString(lastStatus["engine"]) == "llama" ? "llama.cpp" : "whisper.cpp";
+            string detail = engineName + "｜" + (idle > 0 ? "閒置 " + idle + " 分鐘自動卸載" : "不自動卸載");
             if (lastStatus["unloadAt"] != null)
             {
                 double leftMs = Convert.ToDouble(lastStatus["unloadAt"]) - (DateTime.UtcNow - new DateTime(1970, 1, 1)).TotalMilliseconds;
@@ -366,8 +462,9 @@ namespace WhisprGateway
             }
             miDetail.Text = detail;
 
-            miIdle.Enabled = miModel.Enabled = miDevice.Enabled = miPunct.Enabled = miRemote.Enabled = true;
+            miIdle.Enabled = miModel.Enabled = miDevice.Enabled = miPunct.Enabled = miConvert.Enabled = miRemote.Enabled = true;
             miPunct.Checked = lastStatus.ContainsKey("punctuation") && Convert.ToBoolean(lastStatus["punctuation"]);
+            miConvert.Checked = lastStatus.ContainsKey("convertSimplified") && Convert.ToBoolean(lastStatus["convertSimplified"]);
             miLoad.Enabled = backend == "unloaded";
             miUnload.Enabled = backend == "loaded" && inFlight == 0;
             miRemote.Checked = allowRemote;

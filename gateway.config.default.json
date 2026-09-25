@@ -8,6 +8,7 @@
   "idleMinutes": 15,
   "device": "gpu:0",
   "punctuation": true,
+  "convertSimplified": true,
   "language": "zh",
   "prompt": "以下是繁體中文的句子，有逗號、句號等標點符號。",
   "modelsDir": "models",

@@ -1,49 +1,63 @@
 # WhisprGateway
 
-**OpenWhispr 用的隨需載入語音辨識閘道** — 讓 [OpenWhispr](https://github.com/OpenWhispr/openwhispr) 用你自選的 whisper.cpp 模型（預設聯發科 Breeze-ASR-25，台灣華語＋中英夾雜）做聽寫，模型**平時不佔 GPU**，還會自動補上中文標點。
+**OpenWhispr 用的隨需載入語音辨識閘道** — 讓 [OpenWhispr](https://github.com/OpenWhispr/openwhispr) 用你自選的本機模型做聽寫：**Qwen3-ASR 系列**（推薦台灣版 TEA-ASR-1.1，原生繁體、自帶標點）或 whisper.cpp 模型（Breeze-ASR-25…）。模型**平時不佔 GPU**，可從系統匣切換模型／GPU／CPU，也能給區域網路或 VPN 上的其他電腦用。
 
-> *English summary:* a tiny Windows tray app + Node gateway that exposes an OpenAI-compatible `/v1/audio/transcriptions` endpoint for OpenWhispr's **self-hosted** mode. It spawns whisper.cpp's `whisper-server` only when a request arrives and unloads it after N idle minutes (0 VRAM when idle), lets you pick GPU / CPU and the ggml model from the tray, can serve other PCs on your LAN/VPN, and adds Chinese punctuation from segment boundaries (useful for Breeze-ASR-25, which emits almost none). Nothing large is bundled — it borrows the engine that OpenWhispr's "Enable GPU" button installs. UI and docs are in Traditional Chinese.
+> *English summary:* a tiny Windows tray app + Node gateway that exposes an OpenAI-compatible `/v1/audio/transcriptions` endpoint for OpenWhispr's **self-hosted** mode. It runs either llama.cpp's `llama-server` (Qwen3-ASR family GGUF + mmproj) or whisper.cpp's `whisper-server` (ggml), spawns the server only when a request arrives and unloads it after N idle minutes (0 VRAM when idle), lets you pick the model and GPU / CPU from the tray, converts Simplified output to Taiwan Traditional without rewriting vocabulary, adds punctuation for whisper models from segment boundaries, and can serve other PCs on your LAN/VPN. Nothing large is bundled. UI and docs are in Traditional Chinese.
 
-非官方專案，與 OpenWhispr、MediaTek 無關。開發與測試環境：Windows 11、OpenWhispr 1.9.1、Node 26.7、RTX 5080。
+非官方專案，與 OpenWhispr、阿里 Qwen、MediaTek 無關。開發與測試環境：Windows 11、OpenWhispr 1.9.1、Node 26.7、RTX 5080。
 
 ## 為什麼需要它
 
-OpenWhispr 1.9.1 的本機模式：只能用內建的 6 個 Whisper 模型、一啟動就把模型常駐在 GPU 直到關閉（沒有閒置卸載）、模型也不能給別台電腦用。這個閘道補上這三點，OpenWhispr 本身完全不用改——只要把轉錄模式切到「自架主機」。
+OpenWhispr 1.9.1 的本機模式：只能用內建的 6 個 Whisper 模型、一啟動就把模型常駐在 GPU 直到關閉（沒有閒置卸載）、模型也不能給別台電腦用；而且選「中文（繁體）」時會用 OpenCC「台灣用語」表偷偷改寫你的用詞（`數據→資料`、`參數→引數`、`擴展→擴充套件`…，見 [docs/openwhispr-notes.md](docs/openwhispr-notes.md)）。這個閘道補上這些，OpenWhispr 本身完全不用改——只要把轉錄模式切到「自架主機」。
 
 ```
 OpenWhispr（模式＝自架主機；同一台或別台電腦）
    └─ POST http://<這台的位址>:8790/v1/audio/transcriptions
         └─ whisper-gateway.js（Node，常駐、幾乎不耗資源）
-             └─ 有請求才啟動 whisper.cpp 的 whisper-server（127.0.0.1:8791）＋模型，閒置後結束
+             └─ 有請求才啟動辨識伺服器（127.0.0.1:8791）＋模型，閒置後結束
+                  *.gguf → llama.cpp llama-server（Qwen3-ASR / TEA-ASR）
+                  *.bin  → whisper.cpp whisper-server（Breeze-ASR-25 / Whisper）
 WhisprGateway.exe = 系統匣圖示（語）：看管閘道 + 手動控制
 ```
 
-實測（RTX 5080、Breeze-ASR-25 q8_0、13 秒音檔）：冷啟動首句約 2.2 秒、之後約 0.75 秒，載入時 VRAM 約 +2.3 GB、卸載後歸零；純 CPU 約 8.5–10 秒。
+## 模型
+
+| 模型 | 引擎 | 大小 | 特點 |
+|---|---|---|---|
+| **Qwen3-ASR-1.7B**（預設推薦）／0.6B | llama.cpp | 2.17 GB／0.80 GB ＋ mmproj 0.36／0.21 GB | 阿里官方（2026-01，Apache-2.0），30 語言＋22 種漢語方言口音，不需台灣微調就能處理台灣口音與中英夾雜，自帶標點；輸出簡體，閘道自動轉台灣繁體字形（只轉字、不換詞）。0.6B 小很多、更快，合成語音測試與 1.7B 結果相同，真人語音略遜 |
+| TEA-ASR-1.1 | llama.cpp | Q6_K 1.42 GB ＋ mmproj 0.36 GB | Qwen3-ASR-1.7B 的台灣微調（MIT）：原生繁體＋台灣用字。作者公布 CommonVoice zh-TW 錯誤率 3.58%（Qwen3-ASR 3.90%、Breeze 8.03%）。在 llama.cpp 下的小怪癖：新行程的第一句偶爾回空白（閘道會自動重試一次）、時間會寫成「3:00」、逗號較少 |
+| Breeze-ASR-25 | whisper.cpp | q8_0 1.66 GB | MediaTek 台灣華語微調；不太輸出標點，由閘道依停頓補上；只需要 OpenWhispr 的引擎 |
+
+下載指令與 sha256 見 [models/README.md](models/README.md)。**更換模型＝把檔案放進 `models\`，再從系統匣「模型」選它。**
+
+三個 Qwen 系模型都會把台灣人說的「網路」寫成「網絡」這類大陸用詞。閘道用 `data\taiwan-lexicon.txt` 改回來——預設只有十來個台灣人不會說出口的詞（網絡→網路、軟件→軟體、服務器→伺服器…），可自行增刪或清空；這和 OpenWhispr 那種整表改寫是兩回事。
+
+實測（RTX 5080、13 秒合成音檔）：TEA-ASR-1.1 Q6_K 見下方「效能」；Breeze q8_0 冷啟動首句約 2.2 秒、之後約 0.75 秒，載入時 VRAM 約 +2.3 GB；純 CPU 時 TEA-ASR 約 4.7 秒、Breeze 約 8.5–10 秒。
 
 ## 相依項目（**不內附**，請自行準備）
 
-這個 app 本身只有幾十 KB；大的東西（辨識引擎約 1 GB、ffmpeg 約 80 MB）不隨附、也不轉散布，啟動時依下列順序自動尋找。缺少時，系統匣選單會以紅字顯示缺什麼。
+這個 app 本身只有幾十 KB；大的東西（引擎、ffmpeg、模型）不隨附、也不轉散布，啟動時依下列順序自動尋找。缺少時，系統匣選單會以紅字顯示缺什麼。
 
 | 相依 | 需求 | 尋找順序 | 怎麼取得 |
 |---|---|---|---|
 | **Node.js** | 18.2 以上（實測 26.7） | `runtime\node.exe` → PATH | <https://nodejs.org> |
-| **辨識引擎（GPU）** | whisper.cpp `whisper-server`；CUDA 版需 NVIDIA 驅動、運算能力 6.1+（GTX 10 系列以上） | `engine\cuda\` → `%APPDATA%\open-whispr\bin\whisper-cuda\` | **最簡單：安裝 OpenWhispr → 設定 → 語音轉文字 → 本機 →「啟用 GPU」**（約 770 MB）。閘道直接借用，不需複製。 |
-| 辨識引擎（Vulkan，選配） | AMD／Intel GPU 用 | `engine\vulkan\` → `%APPDATA%\open-whispr\bin\whisper-vulkan\` | 在沒有 NVIDIA GPU 的電腦上按 OpenWhispr 的「啟用 GPU」會裝這個。**此路徑尚未實測。** |
-| **辨識引擎（CPU）** | 同上的 CPU 版；也是 GPU 失敗時的退路 | `engine\cpu\` → `<OpenWhispr 安裝目錄>\resources\bin\` | 隨 OpenWhispr 安裝就有 |
-| **ffmpeg** | 4.0 以上、含 opus 解碼（實測 6.1.1）。OpenWhispr 送來的是 webm/opus，whisper-server 只讀 wav | `engine\ffmpeg\ffmpeg.exe` → PATH → OpenWhispr 內附的 ffmpeg-static | 裝了 OpenWhispr 就有；或 `winget install Gyan.FFmpeg` |
-| **模型** | whisper.cpp 的 ggml `.bin` | `models\<modelFile>` | 見 [models/README.md](models/README.md) |
-
-不想裝 OpenWhispr 的話，引擎的原始出處是 <https://github.com/OpenWhispr/whisper.cpp/releases>（tag `0.0.9`：`whisper-server-win32-x64-cuda.zip`／`-vulkan.zip`／`-cpu.zip`），解壓到對應的 `engine\<cuda|vulkan|cpu>\`，檔名保持 `whisper-server-win32-x64[-cuda|-vulkan].exe`。
+| **llama.cpp**（GGUF 模型用） | `llama-server`，b11178 以上（Qwen3-ASR 支援於 2026-04 併入） | `engine\llama-cuda\` → `engine\llama-vulkan\` → OpenWhispr 的 `%APPDATA%\open-whispr\bin\llama-vulkan\` → `engine\llama-cpu\` → OpenWhispr 內附的 CPU 版 | 從 <https://github.com/ggml-org/llama.cpp/releases> 下載 `llama-bNNNN-bin-win-vulkan-x64.zip`（約 32 MB，任何廠牌 GPU）解壓到 `engine\llama-vulkan\`；或 `-cuda-12.4-x64.zip`＋`cudart-llama-bin-win-cuda-12.4-x64.zip` 一起解壓到 `engine\llama-cuda\`。**只裝了 OpenWhispr 也能跑（用它內附的 CPU 版），只是慢。** |
+| **whisper.cpp**（ggml 模型用） | `whisper-server`；CUDA 版需 NVIDIA 運算能力 6.1+ | `engine\whisper-cuda\` → `%APPDATA%\open-whispr\bin\whisper-cuda\`（Vulkan、CPU 類推） | **安裝 OpenWhispr → 設定 → 語音轉文字 → 本機 →「啟用 GPU」**（約 770 MB），閘道直接借用；或從 <https://github.com/OpenWhispr/whisper.cpp/releases> 自取 |
+| **ffmpeg** | 4.0 以上、含 opus 解碼（實測 6.1.1）。OpenWhispr 送 webm/opus，兩個引擎都只讀 wav | `engine\ffmpeg\ffmpeg.exe` → PATH → OpenWhispr 內附的 ffmpeg-static | 裝了 OpenWhispr 就有；或 `winget install Gyan.FFmpeg` |
+| **模型** | 見上表 | `models\` | [models/README.md](models/README.md) |
+| OpenCC 字典（簡→繁用） | 3 個文字檔約 1 MB（Apache-2.0） | `data\opencc\` | 第一次需要時閘道自動從 OpenCC 的 GitHub 抓；離線時簡體輸出就不轉換並在選單提示 |
 
 > 借用 OpenWhispr 的引擎時，若在 OpenWhispr 裡刪除 GPU 引擎或解除安裝 OpenWhispr，閘道會退回 CPU 或無法辨識。
 
 ## 安裝
 
-1. 準備上表的相依（Node.js、OpenWhispr 並按「啟用 GPU」、下載模型到 `models\`）。
+1. 準備上表的相依（Node.js、OpenWhispr、llama.cpp 解壓到 `engine\`、模型下載到 `models\`）。
 2. 取得程式：從 **Releases** 下載 `WhisprGateway-vX.Y.Z.zip` 解壓即可——那個 zip 是 GitHub Actions 從該版本標籤的原始碼自動編譯、打包的（發佈說明附 sha256）。也可以自己編譯：clone 之後執行 `build.ps1`（用 Windows 內建的 C# 編譯器，不需要安裝 SDK）。
-3. 執行 `WhisprGateway.exe`。系統匣出現「語」圖示（Windows 11 預設收在「^」裡，可拖到工作列）；有缺東西會以紅字提示。第一次執行會由 `gateway.config.default.json` 產生 `gateway.config.json`。
-4. 點圖示 →「OpenWhispr 要填什麼…」，照著在 OpenWhispr 填：設定 → 語音轉文字 → **自架主機** → 端點 URL `http://127.0.0.1:8790/v1`（API Key、模型名稱留空）；偏好設定 → 轉錄語言 → **中文（繁體）**。
-5. 要跟著系統啟動，就在選單勾「開機（登入）時自動啟動」。資料夾放哪裡都可以（設定用相對路徑）；搬動後重新勾一次自啟動即可。
+3. 執行 `WhisprGateway.exe`。系統匣出現「語」圖示（Windows 11 預設收在「^」裡，可拖到工作列）；有缺東西會以紅字提示。第一次執行會由 `gateway.config.default.json` 產生 `gateway.config.json`；預設模型是 Breeze，到「模型」選單改成你下載的即可。
+4. 點圖示 →「OpenWhispr 要填什麼…」，照著在 OpenWhispr 填：
+   - 設定 → 語音轉文字 → **自架主機** → 端點 URL `http://127.0.0.1:8790/v1`（API Key、模型名稱留空）。
+   - 偏好設定 → 轉錄語言 → **自動**；中文書寫（語音輸入）→ **保持轉錄原樣**。**不要選「中文（繁體）」**——那會讓 OpenWhispr 用「台灣用語」表改寫你的詞（語言由閘道的 `language` 決定，選自動不影響辨識；繁體由模型或閘道負責）。
+5. 要跟著系統啟動，就在選單勾「開機（登入）時自動啟動」。資料夾放哪裡都可以（設定用相對路徑）；搬動後執行一次 exe，自啟動會自動改指新位置。
 
 ### 給其他電腦用
 
@@ -59,16 +73,31 @@ WhisprGateway.exe = 系統匣圖示（語）：看管閘道 + 手動控制
 |---|---|
 | 立即載入／立即卸載 | 手動控制模型是否佔用資源 |
 | 閒置自動卸載 | 5／15／30／60 分鐘／不自動卸載 |
-| 模型 | 列出 `models\` 內的 `*.bin`；**更換模型＝把新的 ggml `.bin` 放進去再選它** |
-| 運算裝置 | 每張 NVIDIA GPU 各一項、Vulkan（有裝該引擎才出現）、純 CPU。指定的 GPU 不在時（例如筆電省電模式移除獨顯）自動退到其他 GPU → Vulkan → CPU，並標示「目前實際使用」 |
-| 自動補標點（依停頓切句） | 見下節；預設開啟 |
+| 模型 | 列出 `models\` 內的 `*.bin` 與 `*.gguf`（mmproj 不列，自動配對） |
+| 運算裝置 | 每張 NVIDIA GPU 各一項（CUDA 版引擎）、Vulkan（有該引擎才出現）、純 CPU。指定的 GPU 不在時（例如筆電省電模式移除獨顯）自動退到其他 GPU → Vulkan → CPU，並標示「目前實際使用」 |
+| 自動補標點（依停頓切句，whisper 模型） | 見下節；預設開啟。Qwen3-ASR 系列自帶標點，不受影響 |
+| 簡體輸出轉台灣繁體（Qwen3-ASR 系列） | 只對看起來是簡體的輸出做 OpenCC s2tw（字形轉換，**不做**台灣用語替換）；預設開啟。TEA-ASR 等原生繁體的輸出不會被動到 |
 | 允許其他電腦連線（區域網路／VPN） | 見上節；預設關閉 |
 | OpenWhispr 要填什麼… | 顯示端點網址，可一鍵複製 |
-| 開機（登入）時自動啟動 | HKCU `…\Run\WhisprGateway` |
+| 開機（登入）時自動啟動 | 建立／刪除工作排程器的 `WhisprGateway` 工作（登入後延遲 20 秒啟動，不需要系統管理員）。可用 `schtasks /Run /TN WhisprGateway` 當場測試；資料夾搬動後，下次執行 exe 會自動把工作指到新位置 |
 
 圖示顏色：綠＝已載入、橘＝載入中、灰＝未載入、紅＝閘道沒回應。
 
-## 標點符號
+## 效能
+
+RTX 5080、13 秒合成音檔、模型已載入時的每句耗時（含 webm→wav 轉檔）：
+
+| 模型 | 載入（冷啟動，Vulkan） | 每句（已載入） | VRAM |
+|---|---|---|---|
+| Qwen3-ASR-1.7B Q8_0 | 約 3 秒 | 0.3–0.4 秒 | +3.2 GB |
+| Qwen3-ASR-0.6B Q8_0 | 約 2 秒 | 0.25 秒 | +1.9 GB |
+| TEA-ASR-1.1 Q6_K | 約 3 秒（本機第一次用 Vulkan 時 14 秒） | 0.3–0.8 秒 | +2.8 GB |
+| Breeze-ASR-25 q8_0（whisper CUDA） | 約 2 秒 | 0.75 秒 | +2.3 GB |
+| 純 CPU 參考 | — | Qwen3-ASR-0.6B 約 2 秒、TEA-ASR 約 4.7 秒、Breeze 約 8.5–10 秒 | 0 |
+
+第一句要加上載入模型的時間（幾秒；重開機後第一次會更久，磁碟快取的關係）。
+
+## 標點符號（whisper 模型）
 
 Breeze-ASR-25 本身幾乎不輸出標點（試過多種 prompt，最多換來零星的半形逗號）。但它的時間軸對齊很好：開啟時間軸後，**分段剛好切在子句邊界**（實測一段含 8 個標點的話切出 8 段、位置完全一致）。所以標點由閘道補：
 
@@ -76,13 +105,11 @@ Breeze-ASR-25 本身幾乎不輸出標點（試過多種 prompt，最多換來�
 - 下一段以 `另外／此外／對了／首先／其次／再來／最後／總之／接下來／順便／話說` 開頭、或兩段之間停頓 ≥ 0.7 秒、或最後一段 → `。`
 - 其餘 → `，`；並把半形 `, ? !` 轉全形、去掉中文與數字間多餘的空格。純英文的分段不動。
 
-規則刻意保守（錯的逗號比錯的句號好讀），在 `whisper-gateway.js` 的 `QUESTION_END`／`SENTENCE_OPENER`／`LONG_PAUSE_SECONDS`，歡迎調整。幾乎不增加延遲。
-
-限制：目前只用合成語音驗證過，停頓很規律；真人說話若句中猶豫會多出逗號、一口氣講完則標點偏少。要更像書面語，可再疊 OpenWhispr 的「語言模型」文字整理。用會自己輸出標點的模型（例如原版 Whisper large-v3）時，可以把這個功能關掉。
+規則刻意保守（錯的逗號比錯的句號好讀），在 `whisper-gateway.js` 的 `QUESTION_END`／`SENTENCE_OPENER`／`LONG_PAUSE_SECONDS`，歡迎調整。Qwen3-ASR 系列自己會輸出標點，走的是另一條路徑。
 
 ## 自架模式的取捨
 
-沒有「即時轉錄預覽」；OpenWhispr 內的自訂字典不會送出——專有名詞請加在 `gateway.config.json` 的 `prompt`。
+沒有「即時轉錄預覽」；OpenWhispr 內的自訂字典不會送出——用 whisper 模型時可把專有名詞加在 `gateway.config.json` 的 `prompt`（Qwen3-ASR 的 llama-server 端點目前不接受提示詞）。
 
 ## 設定檔 `gateway.config.json`
 
@@ -92,19 +119,22 @@ Breeze-ASR-25 本身幾乎不輸出標點（試過多種 prompt，最多換來�
 | `listen` | `"auto"`＝127.0.0.1＋（允許外部連線時）本機所有私有 IPv4 位址；也可寫成位址陣列 |
 | `remoteInterfaces` | 介面名稱的正規表示式，空字串＝全部（例：`zerotier|tailscale`） |
 | `allowCidrs` | `"auto"`＝上述介面所在網段；也可寫成 CIDR 陣列 |
-| `allowRemote`、`idleMinutes`、`device`、`modelFile`、`punctuation` | 由系統匣選單寫入 |
-| `language`、`prompt` | 傳給 whisper 的語言與提示詞 |
-| `modelsDir`、`engineDir`、`tmpDir` | 相對路徑＝相對於本資料夾 |
+| `allowRemote`、`idleMinutes`、`device`、`modelFile`、`punctuation`、`convertSimplified` | 由系統匣選單寫入 |
+| `language` | 辨識語言：whisper 用代碼（`zh`），Qwen3-ASR 自動換成名稱（`Chinese`）；`auto` 為自動偵測 |
+| `prompt` | 只給 whisper 模型的提示詞 |
+| `llamaContext` | llama-server 的 context 長度，預設 4096（約 5 分鐘音訊夠用） |
+| `modelsDir`、`engineDir`、`dataDir`、`tmpDir` | 相對路徑＝相對於本資料夾 |
+| `data\taiwan-lexicon.txt` | Qwen3-ASR 系列輸出的用詞替換表（非設定檔欄位；第一次執行自動產生，可編輯） |
 
 **執行中只有閘道會寫這個檔**；要手改請先從選單「結束」，改完再開。`/control/*`（系統匣用的控制介面）只接受本機呼叫。`gateway.log` 只記時間、來源 IP、耗時，不記辨識內容。
 
 ## 其他
 
-- [docs/openwhispr-notes.md](docs/openwhispr-notes.md)：做這個專案時整理的 OpenWhispr 1.9.1 行為筆記（固定模型槽位、GPU 失敗旗標、Vulkan 裝置釘選、自架模式的請求格式…）。
+- [docs/openwhispr-notes.md](docs/openwhispr-notes.md)：做這個專案時整理的 OpenWhispr 1.9.1 行為筆記（固定模型槽位、GPU 失敗旗標、Vulkan 裝置釘選、自架模式的請求格式、OpenCC twp 改詞…）。
 - `tools\`：離線測試腳本（用 Windows 內建 TTS 合成測試音檔）。
 - `src\GatewayTray.cs`：系統匣程式原始碼（C# 5 語法）。`WhisprGateway.exe --render-info out.png` 可把資訊視窗畫成圖檢查版面。
-- 已知限制：僅 Windows；自啟動是「登入時」而非開機未登入時；whisper-server 的 `--prompt` 在 Windows 會被 ANSI code page 弄壞，所以中文 prompt 由閘道以 UTF-8 multipart 欄位注入。
+- 已知限制：僅 Windows；自啟動是「登入時」而非開機未登入時；重開機後第一次載入模型較慢；whisper-server 的 `--prompt` 在 Windows 會被 ANSI code page 弄壞，所以中文 prompt 由閘道以 UTF-8 multipart 欄位注入；Qwen3-ASR 回覆開頭的 `language Chinese<asr_text>` 標記由閘道去掉。
 
 ## 致謝
 
-[OpenWhispr](https://github.com/OpenWhispr/openwhispr)、[whisper.cpp](https://github.com/ggml-org/whisper.cpp)、[MediaTek Research Breeze-ASR-25](https://huggingface.co/MediaTek-Research/Breeze-ASR-25)、[shdennlin 的 ggml 轉檔](https://huggingface.co/shdennlin/breeze-asr-25-ggml)。
+[OpenWhispr](https://github.com/OpenWhispr/openwhispr)、[llama.cpp](https://github.com/ggml-org/llama.cpp)、[whisper.cpp](https://github.com/ggml-org/whisper.cpp)、[Qwen3-ASR](https://github.com/QwenLM/Qwen3-ASR)、[JacobLinCool 的 TEA-ASR](https://huggingface.co/JacobLinCool/TEA-ASR-1.1)、[mradermacher 的 GGUF 量化](https://huggingface.co/mradermacher/TEA-ASR-1.1-GGUF)、[MediaTek Research Breeze-ASR-25](https://huggingface.co/MediaTek-Research/Breeze-ASR-25)、[shdennlin 的 ggml 轉檔](https://huggingface.co/shdennlin/breeze-asr-25-ggml)、[OpenCC](https://github.com/BYVoid/OpenCC)。
