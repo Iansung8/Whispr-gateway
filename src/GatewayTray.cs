@@ -182,7 +182,7 @@ namespace WhisprGateway
         readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer();
         readonly Dictionary<string, Icon> icons = new Dictionary<string, Icon>();
 
-        ToolStripMenuItem miStatus, miDetail, miProblem, miLoad, miUnload, miIdle, miModel, miDevice, miPunct, miConvert, miRemote, miAutostart;
+        ToolStripMenuItem miStatus, miDetail, miProblem, miLoad, miUnload, miIdle, miModel, miDevice, miPunct, miConvert, miVocab, miRemote, miAutostart;
         readonly int[] idleChoices = new int[] { 5, 15, 30, 60, 0 };
 
         Process nodeProc;
@@ -270,6 +270,14 @@ namespace WhisprGateway
                 Call("POST", "/control/convert?enabled=" + (miConvert.Checked ? "false" : "true"));
                 Refresh();
             };
+            // Both files are plain text the gateway re-reads on the next request (no restart needed).
+            miVocab = new ToolStripMenuItem("詞彙（Qwen3-ASR 系列）");
+            ToolStripMenuItem miVocabEdit = new ToolStripMenuItem("編輯詞彙提示（英文術語、人名、專有名詞）…");
+            ToolStripMenuItem miLexEdit = new ToolStripMenuItem("編輯台灣用詞替換表…");
+            miVocabEdit.Click += delegate { OpenDataFile("vocabularyFile"); };
+            miLexEdit.Click += delegate { OpenDataFile("lexiconFile"); };
+            miVocab.DropDownItems.Add(miVocabEdit);
+            miVocab.DropDownItems.Add(miLexEdit);
             miLoad = new ToolStripMenuItem("立即載入模型（佔用 GPU）");
             miUnload = new ToolStripMenuItem("立即卸載模型（釋放 GPU）");
             miIdle = new ToolStripMenuItem("閒置自動卸載");
@@ -321,7 +329,7 @@ namespace WhisprGateway
             menu.Items.AddRange(new ToolStripItem[] {
                 miStatus, miDetail, miProblem, new ToolStripSeparator(),
                 miLoad, miUnload, new ToolStripSeparator(),
-                miIdle, miModel, miDevice, miPunct, miConvert, miRemote, new ToolStripSeparator(),
+                miIdle, miModel, miDevice, miPunct, miConvert, miVocab, miRemote, new ToolStripSeparator(),
                 miInfo, miAutostart, new ToolStripSeparator(),
                 miLog, miRestart, miQuit });
             menu.Opening += delegate { Refresh(); RebuildModelMenu(); RebuildDeviceMenu(); miAutostart.Checked = autostartOn; };
@@ -358,6 +366,18 @@ namespace WhisprGateway
                 note.Enabled = false;
                 miDevice.DropDownItems.Add(note);
             }
+        }
+
+        // Opens one of the gateway's editable text files (paths come from /control/status).
+        void OpenDataFile(string key)
+        {
+            string file = lastStatus != null && lastStatus.ContainsKey(key) ? Convert.ToString(lastStatus[key]) : null;
+            if (string.IsNullOrEmpty(file) || !File.Exists(file))
+            {
+                notify.ShowBalloonTip(5000, "語音辨識閘道", "檔案還沒建立：閘道啟動後會自動產生，請稍後再試。", ToolTipIcon.Info);
+                return;
+            }
+            Process.Start("notepad.exe", "\"" + file + "\"");
         }
 
         // Any ggml *.bin dropped into modelsDir becomes selectable - that is how a model is updated.
@@ -421,7 +441,7 @@ namespace WhisprGateway
                 miStatus.Text = "狀態：閘道未回應";
                 miDetail.Text = " ";
                 miProblem.Visible = false;
-                miLoad.Enabled = miUnload.Enabled = miIdle.Enabled = miModel.Enabled = miDevice.Enabled = miPunct.Enabled = miConvert.Enabled = miRemote.Enabled = false;
+                miLoad.Enabled = miUnload.Enabled = miIdle.Enabled = miModel.Enabled = miDevice.Enabled = miPunct.Enabled = miConvert.Enabled = miVocab.Enabled = miRemote.Enabled = false;
                 return;
             }
 
@@ -462,7 +482,7 @@ namespace WhisprGateway
             }
             miDetail.Text = detail;
 
-            miIdle.Enabled = miModel.Enabled = miDevice.Enabled = miPunct.Enabled = miConvert.Enabled = miRemote.Enabled = true;
+            miIdle.Enabled = miModel.Enabled = miDevice.Enabled = miPunct.Enabled = miConvert.Enabled = miVocab.Enabled = miRemote.Enabled = true;
             miPunct.Checked = lastStatus.ContainsKey("punctuation") && Convert.ToBoolean(lastStatus["punctuation"]);
             miConvert.Checked = lastStatus.ContainsKey("convertSimplified") && Convert.ToBoolean(lastStatus["convertSimplified"]);
             miLoad.Enabled = backend == "unloaded";

@@ -317,7 +317,7 @@ function startBackend(device) {
   } else {
     args = [
       "-m", modelPath(), "--mmproj", path.join(modelsDir, model.mmproj), "--host", "127.0.0.1", "--port", String(cfg.backendPort),
-      "-c", String(cfg.llamaContext || 4096), "-np", "1", "--no-webui", "-ngl", useCpu ? "0" : "99", "-t", threads,
+      "-c", String(cfg.llamaContext || 8192), "-np", "1", "--no-webui", "-ngl", useCpu ? "0" : "99", "-t", threads,
     ];
   }
 
@@ -334,6 +334,7 @@ function startBackend(device) {
     ready = true;
     activeDevice = device;
     activeEngine = model.engine;
+    chatUnreliable = false;
     log(`${model.engine} server ready on ${device} (${model.id}) in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
   });
 }
@@ -387,6 +388,9 @@ function status() {
     allowRemote: cfg.allowRemote,
     punctuation: cfg.punctuation !== false,
     convertSimplified: cfg.convertSimplified,
+    vocabularyTerms: vocabulary.length,
+    vocabularyFile: path.join(dataDir, "vocabulary.txt"),
+    lexiconFile: path.join(dataDir, "taiwan-lexicon.txt"),
     listening: [...listening.keys()],
     addresses: candidates.map((c) => ({ address: c.address, name: c.name })),
     port: cfg.port,
@@ -599,7 +603,7 @@ const stripAsrTag = (text) => String(text || "")
 
 // -- Taiwan lexicon --
 // Qwen3-ASR models (TEA-ASR included) were trained mostly on Mainland text and write 網絡/軟件/服務器
-// even when a Taiwanese speaker said 網路/軟體/伺服器. data	aiwan-lexicon.txt maps such words back; it is
+// even when a Taiwanese speaker said 網路/軟體/伺服器. data\taiwan-lexicon.txt maps such words back; it is
 // created with a short list of terms a Taiwanese speaker never says, and the user can edit or empty it.
 // Deliberately tiny: this is the opposite of OpenWhispr's blanket "twp" rewriting.
 const LEXICON_DEFAULT = `# 台灣用詞表：每行「模型寫法<TAB>改成」。只放台灣人不會說出口的詞，避免改到本來就想說的字。
@@ -630,6 +634,48 @@ function loadLexicon() {
   } catch (err) { lexicon = null; log(`taiwan lexicon unavailable: ${err.message}`); }
 }
 const applyLexicon = (text) => { loadLexicon(); return lexicon && lexicon.map.size ? convertWith(lexicon, text) : text; };
+
+// -- vocabulary hint --
+// Qwen3-ASR was trained to take context, and it uses it: with "CUDA" in the hint a Taiwanese-accented
+// "酷達" comes back as "CUDA" (measured). llama-server's transcription endpoint has no prompt field,
+// so the gateway talks to the model through /v1/chat/completions with the instruction + the words in
+// data\vocabulary.txt as the system message. This is the replacement for OpenWhispr's custom
+// dictionary, which its self-hosted mode never sends.
+const VOCABULARY_DEFAULT = `# 詞彙提示：一行一個詞（英文術語、人名、專有名詞）。模型辨識時會參考，講台灣腔英文也比較能寫回英文。
+# Vocabulary hint for Qwen3-ASR family models: one term per line; # starts a comment. Edit freely.
+CUDA
+Vulkan
+GPU
+llama.cpp
+OpenWhispr
+API
+GitHub
+Python
+Node.js
+Claude
+Ollama
+ZeroTier
+`;
+let vocabulary = []; // terms
+let vocabularyMtime = 0;
+function loadVocabulary() {
+  const file = path.join(dataDir, "vocabulary.txt");
+  try {
+    if (!fs.existsSync(file)) { fs.mkdirSync(dataDir, { recursive: true }); fs.writeFileSync(file, VOCABULARY_DEFAULT, "utf8"); }
+    const mtime = fs.statSync(file).mtimeMs;
+    if (mtime === vocabularyMtime) return;
+    vocabulary = fs.readFileSync(file, "utf8").split(/\r?\n/).map((l) => l.trim()).filter((l) => l && !l.startsWith("#"));
+    vocabularyMtime = mtime;
+    log(`vocabulary hint loaded (${vocabulary.length} terms)`);
+  } catch (err) { vocabulary = []; log(`vocabulary hint unavailable: ${err.message}`); }
+}
+const LLAMA_INSTRUCTION_DEFAULT = "以下是台灣人講的中文，夾雜英文術語時請保留英文原文；數字與型號請用阿拉伯數字。";
+function systemPrompt() {
+  loadVocabulary();
+  const inst = typeof cfg.llamaInstruction === "string" ? cfg.llamaInstruction.trim() : LLAMA_INSTRUCTION_DEFAULT;
+  const words = vocabulary.length ? `常見詞彙：${vocabulary.join(", ")}` : "";
+  return [inst, words].filter(Boolean).join("\n") || null;
+}
 
 // ---- multipart helpers ----
 // Adds a multipart text field in front of the body unless the client already sent that field.
@@ -700,10 +746,10 @@ const languageName = (code) => (!code || code === "auto") ? null : (LANGUAGE_NAM
 // ---- HTTP front ----
 const MAX_BODY_BYTES = 512 * 1024 * 1024;
 
-function postBackend(body, contentType) {
+function postBackend(body, contentType, urlPath = "/v1/audio/transcriptions") {
   return new Promise((resolve, reject) => {
     const req = http.request(
-      { host: "127.0.0.1", port: cfg.backendPort, path: "/v1/audio/transcriptions", method: "POST",
+      { host: "127.0.0.1", port: cfg.backendPort, path: urlPath, method: "POST",
         headers: { "Content-Type": contentType, "Content-Length": String(body.length) } },
       (up) => {
         const parts = [];
@@ -738,30 +784,60 @@ async function transcribeWhisper(body, contentType) {
 }
 
 // llama-server (Qwen3-ASR family): wav in, model chatter and Simplified script out.
+// Two ways to ask the model: the chat endpoint (takes the vocabulary hint; preferred) and the plain
+// transcription endpoint (no hint). Fine-tunes such as TEA-ASR answer the chat endpoint with nothing
+// but the language tag, so an empty chat reply switches this backend session to the plain endpoint.
+let chatUnreliable = false;
+
+async function llamaChat(wav) {
+  const messages = [];
+  const system = systemPrompt();
+  if (system) messages.push({ role: "system", content: system });
+  messages.push({ role: "user", content: [{ type: "input_audio", input_audio: { data: wav.toString("base64"), format: "wav" } }] });
+  const body = Buffer.from(JSON.stringify({ messages, temperature: 0, max_tokens: cfg.llamaMaxTokens || 2048 }), "utf8");
+  const reply = await postBackend(body, "application/json", "/v1/chat/completions");
+  if (reply.statusCode !== 200) throw new Error(`chat endpoint HTTP ${reply.statusCode}`);
+  const data = JSON.parse(reply.raw.toString("utf8"));
+  const content = data?.choices?.[0]?.message?.content;
+  if (typeof content !== "string") throw new Error("chat endpoint reply without content");
+  return content;
+}
+
+async function llamaTranscriptions(wav, language) {
+  const fields = { response_format: "json" };
+  if (language) fields.language = language;
+  const req = buildMultipart(fields, { name: "audio.wav", type: "audio/wav", data: wav });
+  const reply = await postBackend(req.body, req.contentType);
+  if (reply.statusCode !== 200) throw new Error(`transcription endpoint HTTP ${reply.statusCode}: ${reply.raw.toString("utf8").slice(0, 120)}`);
+  const data = JSON.parse(reply.raw.toString("utf8"));
+  if (typeof data.text !== "string") throw new Error("transcription endpoint reply without text");
+  return data.text;
+}
+
 async function transcribeLlama(body, contentType) {
   const parsed = parseMultipart(body, contentType);
   if (!parsed || !parsed.file) throw new Error("multipart upload without a file field");
   const wav = /wav/i.test(parsed.file.type) || /\.wav$/i.test(parsed.file.name) ? parsed.file.data : await toWav(parsed.file.data);
-  const fields = { response_format: "json" };
-  const lang = languageName(parsed.fields.language || cfg.language);
-  if (lang) fields.language = lang;
-  const req = buildMultipart(fields, { name: "audio.wav", type: "audio/wav", data: wav });
-  let reply = await postBackend(req.body, req.contentType);
-  try {
-    let data = JSON.parse(reply.raw.toString("utf8"));
-    // TEA-ASR occasionally answers a fresh process's first request with nothing but the language tag;
-    // one retry (~0.3 s) has always produced the transcript. Only for audio longer than about a second.
-    if (typeof data.text === "string" && !stripAsrTag(data.text).trim() && wav.length > 32000) {
-      log("llama backend returned empty text; retrying once");
-      reply = await postBackend(req.body, req.contentType);
-      data = JSON.parse(reply.raw.toString("utf8"));
+  const language = languageName(parsed.fields.language || cfg.language);
+  const substantial = wav.length > 32000; // more than about a second of audio should never transcribe to nothing
+  let text = null;
+  let via = "chat";
+  if (cfg.llamaMode !== "transcriptions" && !chatUnreliable) {
+    try { text = await llamaChat(wav); } catch (err) { log(`chat endpoint failed (${err.message}); using the transcription endpoint`); }
+    if (text !== null && substantial && !stripAsrTag(text).trim()) {
+      chatUnreliable = true;
+      log("chat endpoint returned no transcript for this model; using the transcription endpoint until the next load");
+      text = null;
     }
-    if (typeof data.text === "string") {
-      const text = tidy(applyLexicon(toTraditional(stripAsrTag(data.text))));
-      return { statusCode: reply.statusCode, type: "application/json; charset=utf-8", raw: Buffer.from(JSON.stringify({ text }), "utf8") };
-    }
-  } catch {}
-  return reply;
+  }
+  if (text === null) {
+    via = "transcriptions";
+    text = await llamaTranscriptions(wav, language);
+    // TEA-ASR occasionally answers a fresh process's first request with nothing but the language tag.
+    if (substantial && !stripAsrTag(text).trim()) { log("empty transcript; retrying once"); text = await llamaTranscriptions(wav, language); }
+  }
+  const out = tidy(applyLexicon(toTraditional(stripAsrTag(text))));
+  return { statusCode: 200, type: "application/json; charset=utf-8", raw: Buffer.from(JSON.stringify({ text: out }), "utf8"), via };
 }
 
 function handle(req, res) {
@@ -832,7 +908,7 @@ function handle(req, res) {
     .then((reply) => {
       res.writeHead(reply.statusCode, { "Content-Type": reply.type, "Content-Length": reply.raw.length });
       res.end(reply.raw);
-      done(`-> ${reply.statusCode}`);
+      done(`-> ${reply.statusCode}${reply.via ? ` (${reply.via})` : ""}`);
     })
     .catch((err) => {
       if (!res.headersSent) res.writeHead(503, { "Content-Type": "application/json" });
@@ -848,6 +924,8 @@ log(`gateway starting (model=${cfg.modelFile} engine=${currentModel().engine} de
 refreshGpus();
 refreshListeners();
 if (currentModel().engine === "llama" && cfg.convertSimplified) loadScriptDicts();
+loadVocabulary();
+loadLexicon(); // both files exist from the first start on, so the tray's "edit" items always have something to open
 setInterval(refreshListeners, 20000); // picks up ZeroTier coming up after logon
 setInterval(refreshGpus, 120000); // a dGPU can appear / disappear (laptop eco mode)
 setTimeout(() => { for (const p of problems()) log(`problem: ${p}`); }, 10000); // after the first GPU scan has answered

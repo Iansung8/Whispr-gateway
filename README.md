@@ -77,6 +77,7 @@ WhisprGateway.exe = 系統匣圖示（語）：看管閘道 + 手動控制
 | 運算裝置 | 每張 NVIDIA GPU 各一項（CUDA 版引擎）、Vulkan（有該引擎才出現）、純 CPU。指定的 GPU 不在時（例如筆電省電模式移除獨顯）自動退到其他 GPU → Vulkan → CPU，並標示「目前實際使用」 |
 | 自動補標點（依停頓切句，whisper 模型） | 見下節；預設開啟。Qwen3-ASR 系列自帶標點，不受影響 |
 | 簡體輸出轉台灣繁體（Qwen3-ASR 系列） | 只對看起來是簡體的輸出做 OpenCC s2tw（字形轉換，**不做**台灣用語替換）；預設開啟。TEA-ASR 等原生繁體的輸出不會被動到 |
+| 詞彙（Qwen3-ASR 系列） | 用記事本開啟 `data\vocabulary.txt`（詞彙提示，見下節）或 `data\taiwan-lexicon.txt`（用詞替換表）；存檔即生效 |
 | 允許其他電腦連線（區域網路／VPN） | 見上節；預設關閉 |
 | OpenWhispr 要填什麼… | 顯示端點網址，可一鍵複製 |
 | 開機（登入）時自動啟動 | 建立／刪除工作排程器的 `WhisprGateway` 工作（登入後延遲 20 秒啟動，不需要系統管理員）。可用 `schtasks /Run /TN WhisprGateway` 當場測試；資料夾搬動後，下次執行 exe 會自動把工作指到新位置 |
@@ -107,9 +108,15 @@ Breeze-ASR-25 本身幾乎不輸出標點（試過多種 prompt，最多換來�
 
 規則刻意保守（錯的逗號比錯的句號好讀），在 `whisper-gateway.js` 的 `QUESTION_END`／`SENTENCE_OPENER`／`LONG_PAUSE_SECONDS`，歡迎調整。Qwen3-ASR 系列自己會輸出標點，走的是另一條路徑。
 
+## 詞彙提示（Qwen3-ASR 系列）：讓台灣腔的英文寫回英文
+
+台灣人講「CUDA」，模型常聽成中文音節寫成「酷達」。Qwen3-ASR 訓練時就會參考「上下文詞彙」，所以閘道把 `data\vocabulary.txt` 裡的詞連同一句指示（`gateway.config.json` 的 `llamaInstruction`）當 system prompt 送給模型——實測「酷達」就變回「CUDA」，純中文的句子不受影響。系統匣「詞彙 → 編輯詞彙提示…」會用記事本打開這個檔，一行一個詞，存檔後下一句就生效。這等於補上 OpenWhispr 自訂字典在自架模式送不出來的功能。
+
+技術細節：llama-server 的轉錄端點沒有提示欄位，所以閘道改走 `/v1/chat/completions`（音訊＋system prompt）。微調版（如 TEA-ASR）對 chat 端點常回空白，閘道偵測到就自動改回轉錄端點。目前提示救不回的：多音節的音譯（「拉馬點西批批」→ llama.cpp）、型號數字（RTX 5080 有時寫成「五千零八十」）。
+
 ## 自架模式的取捨
 
-沒有「即時轉錄預覽」；OpenWhispr 內的自訂字典不會送出——用 whisper 模型時可把專有名詞加在 `gateway.config.json` 的 `prompt`（Qwen3-ASR 的 llama-server 端點目前不接受提示詞）。
+沒有「即時轉錄預覽」；OpenWhispr 內的自訂字典不會送出——Qwen3-ASR 系列用上面的詞彙提示代替，whisper 模型則可把專有名詞加在 `gateway.config.json` 的 `prompt`。
 
 ## 設定檔 `gateway.config.json`
 
@@ -122,9 +129,11 @@ Breeze-ASR-25 本身幾乎不輸出標點（試過多種 prompt，最多換來�
 | `allowRemote`、`idleMinutes`、`device`、`modelFile`、`punctuation`、`convertSimplified` | 由系統匣選單寫入 |
 | `language` | 辨識語言：whisper 用代碼（`zh`），Qwen3-ASR 自動換成名稱（`Chinese`）；`auto` 為自動偵測 |
 | `prompt` | 只給 whisper 模型的提示詞 |
-| `llamaContext` | llama-server 的 context 長度，預設 4096（約 5 分鐘音訊夠用） |
+| `llamaInstruction` | 給 Qwen3-ASR 系列的指示句（system prompt 第一行）；預設「以下是台灣人講的中文，夾雜英文術語時請保留英文原文；數字與型號請用阿拉伯數字。」 |
+| `llamaMode` | `chat`（預設，會帶詞彙提示）或 `transcriptions`（不帶提示的純轉錄端點） |
+| `llamaContext`、`llamaMaxTokens` | llama-server 的 context 長度（預設 8192，約 8 分鐘音訊）與單次輸出上限（預設 2048） |
 | `modelsDir`、`engineDir`、`dataDir`、`tmpDir` | 相對路徑＝相對於本資料夾 |
-| `data\taiwan-lexicon.txt` | Qwen3-ASR 系列輸出的用詞替換表（非設定檔欄位；第一次執行自動產生，可編輯） |
+| `data\vocabulary.txt`、`data\taiwan-lexicon.txt` | 詞彙提示、用詞替換表（非設定檔欄位；第一次執行自動產生，可從系統匣「詞彙」編輯） |
 
 **執行中只有閘道會寫這個檔**；要手改請先從選單「結束」，改完再開。`/control/*`（系統匣用的控制介面）只接受本機呼叫。`gateway.log` 只記時間、來源 IP、耗時，不記辨識內容。
 
