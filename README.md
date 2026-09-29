@@ -75,6 +75,7 @@ WhisprGateway.exe = 系統匣圖示（語）：看管閘道 + 手動控制
 | 閒置自動卸載 | 5／15／30／60 分鐘／不自動卸載（選這個時，閘道啟動 30 秒後會先把模型載好，重開機後第一句不用等冷載入） |
 | 模型 | 列出 `models\` 內的 `*.bin` 與 `*.gguf`（mmproj 不列，自動配對） |
 | 運算裝置 | 每張 NVIDIA GPU 各一項（CUDA 版引擎）、Vulkan（有該引擎才出現）、純 CPU。指定的 GPU 不在時（例如筆電省電模式移除獨顯）自動退到其他 GPU → Vulkan → CPU，並標示「目前實際使用」 |
+| VRAM 不足時自動讓出 GPU（例如開遊戲時） | 見下節「讓出 GPU」；預設關閉。狀態列會顯示目前 VRAM 用量 |
 | 自動補標點（依停頓切句，whisper 模型） | 見下節；預設開啟。Qwen3-ASR 系列自帶標點，不受影響 |
 | 簡體輸出轉台灣繁體（Qwen3-ASR 系列） | 只對看起來是簡體的輸出做 OpenCC s2tw（字形轉換，**不做**台灣用語替換）；預設開啟。TEA-ASR 等原生繁體的輸出不會被動到 |
 | 詞彙（Qwen3-ASR 系列） | 用記事本開啟 `data\vocabulary.txt`（詞彙提示，見下節）或 `data\taiwan-lexicon.txt`（用詞替換表）；存檔即生效 |
@@ -110,6 +111,17 @@ Breeze-ASR-25 本身幾乎不輸出標點（試過多種 prompt，最多換來�
 
 規則刻意保守（錯的逗號比錯的句號好讀），在 `whisper-gateway.js` 的 `QUESTION_END`／`SENTENCE_OPENER`／`LONG_PAUSE_SECONDS`，歡迎調整。Qwen3-ASR 系列自己會輸出標點，走的是另一條路徑。
 
+## 讓出 GPU（VRAM 不足時自動退避）
+
+開遊戲、LM Studio 或 Stable Diffusion 這類吃 VRAM 的程式時，閘道可以自動把模型從 GPU 卸下，讓給它們：
+
+- 每 5 秒用 `nvidia-smi` 看一次 VRAM（需要 NVIDIA 驅動；幾乎不耗資源）。
+- **其他程式**的用量比過去 10 分鐘的最低點多出 ≥ 1.5 GB（`vramGuardRiseMiB`），或剩餘 VRAM < 1 GB（`vramGuardMinFreeMiB`），持續 10 秒 → 卸載模型、讓出 GPU。瀏覽器、Discord 這類慢慢漲的用量會被「10 分鐘最低點」吸收，不會誤觸發。
+- 讓出期間聽寫**改用 CPU**（較慢，但不碰 VRAM）。
+- 其他程式的用量回落、而且剩餘 VRAM 夠放回模型，持續 60 秒（`vramGuardResumeSeconds`）→ 回到 GPU；若設「不自動卸載」會自動重新載入。
+
+刻意不做「偵測遊戲」：那要維護遊戲清單、掃描行程，而真正在意的其實是 VRAM 被搶——直接看 VRAM 更準，也涵蓋非遊戲的程式。
+
 ## 詞彙提示（Qwen3-ASR 系列）：讓台灣腔的英文寫回英文
 
 台灣人講「CUDA」，模型常聽成中文音節寫成「酷達」。Qwen3-ASR 訓練時就會參考「上下文詞彙」，所以閘道把 `data\vocabulary.txt` 裡的詞連同一句指示（`gateway.config.json` 的 `llamaInstruction`）當 system prompt 送給模型——實測「酷達」就變回「CUDA」，純中文的句子不受影響。系統匣「詞彙 → 編輯詞彙提示…」會用記事本打開這個檔，一行一個詞，存檔後下一句就生效。這等於補上 OpenWhispr 自訂字典在自架模式送不出來的功能。
@@ -128,7 +140,8 @@ Breeze-ASR-25 本身幾乎不輸出標點（試過多種 prompt，最多換來�
 | `listen` | `"auto"`＝127.0.0.1＋（允許外部連線時）本機所有私有 IPv4 位址；也可寫成位址陣列 |
 | `remoteInterfaces` | 介面名稱的正規表示式，空字串＝全部（例：`zerotier|tailscale`） |
 | `allowCidrs` | `"auto"`＝上述介面所在網段；也可寫成 CIDR 陣列 |
-| `allowRemote`、`idleMinutes`、`device`、`modelFile`、`punctuation`、`convertSimplified` | 由系統匣選單寫入 |
+| `allowRemote`、`idleMinutes`、`device`、`modelFile`、`punctuation`、`convertSimplified`、`vramGuard` | 由系統匣選單寫入 |
+| `vramGuardRiseMiB`、`vramGuardMinFreeMiB`、`vramGuardResumeSeconds` | 讓出 GPU 的門檻：其他程式增加多少 MiB（預設 1500）、剩餘低於多少 MiB（預設 1024）、回落後等幾秒才回到 GPU（預設 60） |
 | `language` | 辨識語言：whisper 用代碼（`zh`），Qwen3-ASR 自動換成名稱（`Chinese`）；`auto` 為自動偵測 |
 | `prompt` | 只給 whisper 模型的提示詞 |
 | `llamaInstruction` | 給 Qwen3-ASR 系列的指示句（system prompt 第一行）；預設「以下是台灣人講的中文，夾雜英文術語時請保留英文原文；數字與型號請用阿拉伯數字。」 |
@@ -143,7 +156,7 @@ Breeze-ASR-25 本身幾乎不輸出標點（試過多種 prompt，最多換來�
 
 - [docs/openwhispr-notes.md](docs/openwhispr-notes.md)：做這個專案時整理的 OpenWhispr 1.9.1 行為筆記（固定模型槽位、GPU 失敗旗標、Vulkan 裝置釘選、自架模式的請求格式、OpenCC twp 改詞…）。
 - `tools\`：離線測試腳本（用 Windows 內建 TTS 合成測試音檔）。
-- `src\GatewayTray.cs`：系統匣程式原始碼（C# 5 語法）。`WhisprGateway.exe --render-info out.png` 可把資訊視窗畫成圖檢查版面。
+- `src\GatewayTray.cs`：系統匣程式原始碼（C# 5 語法）。重編前要先結束 exe；開著自動啟動時，看門狗會在 5 分鐘內把它拉回來而鎖住檔案，所以先 `schtasks /Change /TN WhisprGateway /DISABLE`，編完再 `/ENABLE` 和 `/Run`。`WhisprGateway.exe --render-info out.png` 可把資訊視窗畫成圖檢查版面。
 - 已知限制：僅 Windows；自啟動是「登入時」而非開機未登入時；重開機後第一次載入模型較慢；whisper-server 的 `--prompt` 在 Windows 會被 ANSI code page 弄壞，所以中文 prompt 由閘道以 UTF-8 multipart 欄位注入；Qwen3-ASR 回覆開頭的 `language Chinese<asr_text>` 標記由閘道去掉。
 
 ## 致謝

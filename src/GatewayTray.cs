@@ -191,7 +191,7 @@ namespace WhisprGateway
         readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer();
         readonly Dictionary<string, Icon> icons = new Dictionary<string, Icon>();
 
-        ToolStripMenuItem miStatus, miDetail, miProblem, miLoad, miUnload, miIdle, miModel, miDevice, miPunct, miConvert, miVocab, miRemote, miAutostart;
+        ToolStripMenuItem miStatus, miDetail, miProblem, miLoad, miUnload, miIdle, miModel, miDevice, miPunct, miConvert, miVocab, miGuard, miRemote, miAutostart;
         readonly int[] idleChoices = new int[] { 5, 15, 30, 60, 0 };
 
         Process nodeProc;
@@ -287,6 +287,12 @@ namespace WhisprGateway
             miLexEdit.Click += delegate { OpenDataFile("lexiconFile"); };
             miVocab.DropDownItems.Add(miVocabEdit);
             miVocab.DropDownItems.Add(miLexEdit);
+            miGuard = new ToolStripMenuItem("VRAM 不足時自動讓出 GPU（例如開遊戲時）");
+            miGuard.Click += delegate
+            {
+                Call("POST", "/control/vram-guard?enabled=" + (miGuard.Checked ? "false" : "true"));
+                Refresh();
+            };
             miLoad = new ToolStripMenuItem("立即載入模型（佔用 GPU）");
             miUnload = new ToolStripMenuItem("立即卸載模型（釋放 GPU）");
             miIdle = new ToolStripMenuItem("閒置自動卸載");
@@ -338,7 +344,7 @@ namespace WhisprGateway
             menu.Items.AddRange(new ToolStripItem[] {
                 miStatus, miDetail, miProblem, new ToolStripSeparator(),
                 miLoad, miUnload, new ToolStripSeparator(),
-                miIdle, miModel, miDevice, miPunct, miConvert, miVocab, miRemote, new ToolStripSeparator(),
+                miIdle, miModel, miDevice, miGuard, miPunct, miConvert, miVocab, miRemote, new ToolStripSeparator(),
                 miInfo, miAutostart, new ToolStripSeparator(),
                 miLog, miRestart, miQuit });
             menu.Opening += delegate { Refresh(); RebuildModelMenu(); RebuildDeviceMenu(); miAutostart.Checked = autostartOn; };
@@ -450,7 +456,7 @@ namespace WhisprGateway
                 miStatus.Text = "狀態：閘道未回應";
                 miDetail.Text = " ";
                 miProblem.Visible = false;
-                miLoad.Enabled = miUnload.Enabled = miIdle.Enabled = miModel.Enabled = miDevice.Enabled = miPunct.Enabled = miConvert.Enabled = miVocab.Enabled = miRemote.Enabled = false;
+                miLoad.Enabled = miUnload.Enabled = miIdle.Enabled = miModel.Enabled = miDevice.Enabled = miPunct.Enabled = miConvert.Enabled = miVocab.Enabled = miGuard.Enabled = miRemote.Enabled = false;
                 return;
             }
 
@@ -470,6 +476,8 @@ namespace WhisprGateway
             string label = backend == "loaded" ? "模型已載入（" + where + " 使用中）"
                          : backend == "loading" ? "模型載入中…"
                          : "模型未載入（不佔資源）";
+            bool backedOff = lastStatus.ContainsKey("backedOff") && Convert.ToBoolean(lastStatus["backedOff"]);
+            if (backedOff) label = "已讓出 GPU（其他程式在用 VRAM）" + (backend == "loaded" ? "・CPU 模型已載入" : "・需要時用 CPU");
 
             notify.Icon = icons.ContainsKey(backend) ? icons[backend] : icons["unloaded"];
             SetTip("語音辨識閘道：" + label);
@@ -477,6 +485,8 @@ namespace WhisprGateway
 
             string engineName = lastStatus.ContainsKey("engine") && Convert.ToString(lastStatus["engine"]) == "llama" ? "llama.cpp" : "whisper.cpp";
             string detail = engineName + "｜" + (idle > 0 ? "閒置 " + idle + " 分鐘自動卸載" : "不自動卸載");
+            Dictionary<string, object> vr = lastStatus.ContainsKey("vram") ? lastStatus["vram"] as Dictionary<string, object> : null;
+            if (vr != null) detail += "｜VRAM " + (Convert.ToDouble(vr["usedMiB"]) / 1024.0).ToString("0.0") + "/" + (Convert.ToDouble(vr["totalMiB"]) / 1024.0).ToString("0.0") + " GB";
             if (lastStatus["unloadAt"] != null)
             {
                 double leftMs = Convert.ToDouble(lastStatus["unloadAt"]) - (DateTime.UtcNow - new DateTime(1970, 1, 1)).TotalMilliseconds;
@@ -491,7 +501,8 @@ namespace WhisprGateway
             }
             miDetail.Text = detail;
 
-            miIdle.Enabled = miModel.Enabled = miDevice.Enabled = miPunct.Enabled = miConvert.Enabled = miVocab.Enabled = miRemote.Enabled = true;
+            miIdle.Enabled = miModel.Enabled = miDevice.Enabled = miPunct.Enabled = miConvert.Enabled = miVocab.Enabled = miGuard.Enabled = miRemote.Enabled = true;
+            miGuard.Checked = lastStatus.ContainsKey("vramGuard") && Convert.ToBoolean(lastStatus["vramGuard"]);
             miPunct.Checked = lastStatus.ContainsKey("punctuation") && Convert.ToBoolean(lastStatus["punctuation"]);
             miConvert.Checked = lastStatus.ContainsKey("convertSimplified") && Convert.ToBoolean(lastStatus["convertSimplified"]);
             miLoad.Enabled = backend == "unloaded";
