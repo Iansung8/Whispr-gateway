@@ -101,7 +101,9 @@ namespace WhisprGateway
             string xml;
             pointsHere = false;
             if (Schtasks("/Query /TN \"" + TaskName + "\" /XML", out xml) != 0) return false;
-            pointsHere = xml.IndexOf(System.Security.SecurityElement.Escape(Application.ExecutablePath), StringComparison.OrdinalIgnoreCase) >= 0;
+            // "Up to date" = points at this exe AND has the watchdog repetition (older versions lacked it).
+            pointsHere = xml.IndexOf(System.Security.SecurityElement.Escape(Application.ExecutablePath), StringComparison.OrdinalIgnoreCase) >= 0
+                && xml.IndexOf("<Repetition>", StringComparison.OrdinalIgnoreCase) >= 0;
             return true;
         }
 
@@ -124,7 +126,14 @@ namespace WhisprGateway
                 "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\r\n" +
                 "<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\r\n" +
                 "  <RegistrationInfo><Description>Starts the WhisprGateway tray app (on-demand speech-to-text gateway for OpenWhispr) at logon.</Description></RegistrationInfo>\r\n" +
-                "  <Triggers><LogonTrigger><Enabled>true</Enabled><UserId>" + esc(user) + "</UserId><Delay>PT20S</Delay></LogonTrigger></Triggers>\r\n" +
+                "  <Triggers>\r\n" +
+                "    <LogonTrigger><Enabled>true</Enabled><UserId>" + esc(user) + "</UserId><Delay>PT20S</Delay></LogonTrigger>\r\n" +
+                // Watchdog: every 5 minutes. While the tray runs as this task's instance, IgnoreNew makes
+                // the tick a no-op (a manually started copy holds the mutex, so the new one exits at once);
+                // if the tray was killed or crashed, the next tick brings it back.
+                "    <TimeTrigger><Enabled>true</Enabled><StartBoundary>" + DateTime.Now.ToString("yyyy-MM-ddTHH:mm:ss") + "</StartBoundary>" +
+                "<Repetition><Interval>PT5M</Interval><StopAtDurationEnd>false</StopAtDurationEnd></Repetition></TimeTrigger>\r\n" +
+                "  </Triggers>\r\n" +
                 "  <Principals><Principal id=\"Author\"><UserId>" + esc(user) + "</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>\r\n" +
                 "  <Settings>\r\n" +
                 "    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\r\n" +
