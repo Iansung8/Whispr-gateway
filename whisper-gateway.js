@@ -929,3 +929,12 @@ loadLexicon(); // both files exist from the first start on, so the tray's "edit"
 setInterval(refreshListeners, 20000); // picks up ZeroTier coming up after logon
 setInterval(refreshGpus, 120000); // a dGPU can appear / disappear (laptop eco mode)
 setTimeout(() => { for (const p of problems()) log(`problem: ${p}`); }, 10000); // after the first GPU scan has answered
+// "Never unload" (idleMinutes 0) means the user wants the model resident: load it shortly after start so
+// the first dictation after a reboot does not pay the cold load (measured 23 s right after a power cut).
+if (!(cfg.idleMinutes > 0)) {
+  setTimeout(() => {
+    if (child || starting) return;
+    log("preloading model (automatic unload is off)");
+    ensureBackend().then(armIdleTimer).catch((err) => log(`preload failed: ${err.message}`));
+  }, 30000);
+}
