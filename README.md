@@ -117,8 +117,10 @@ Breeze-ASR-25 本身幾乎不輸出標點（試過多種 prompt，最多換來�
 
 - 每 5 秒用 `nvidia-smi` 看一次 VRAM（需要 NVIDIA 驅動；幾乎不耗資源）。
 - **其他程式**的用量比過去 10 分鐘的最低點多出 ≥ 1.5 GB（`vramGuardRiseMiB`），或剩餘 VRAM < 1 GB（`vramGuardMinFreeMiB`），持續 10 秒 → 卸載模型、讓出 GPU。瀏覽器、Discord 這類慢慢漲的用量會被「10 分鐘最低點」吸收，不會誤觸發。
-- 讓出期間聽寫**改用 CPU**（較慢，但不碰 VRAM）。
-- 其他程式的用量回落、而且剩餘 VRAM 夠放回模型，持續 60 秒（`vramGuardResumeSeconds`）→ 回到 GPU；若設「不自動卸載」會自動重新載入。
+- 讓出期間聽寫**改用 CPU**（不碰 VRAM），而且改用較小的模型（`vramGuardCpuModel`，預設 `Qwen3-ASR-0.6B-Q8_0.gguf`，檔案在才用）；設「不自動卸載」時，讓出 90 秒後（遊戲載入完）先把 CPU 模型預載好。實戰量到：遊戲載入中用 1.7B 跑 CPU，第一句要 39 秒。
+- 多出來的用量**退掉七成以上**（或回到原水位 +800 MB 內）、而且剩餘 VRAM 夠放回模型，持續 60 秒（`vramGuardResumeSeconds`）→ 回到 GPU；若設「不自動卸載」會自動重新載入。用「退掉七成」是因為遊戲常留下 NVIDIA Overlay 之類的常駐程式（實測 0.8 GB），只看原水位會一直回不來。
+
+實測《明日方舟：終末地》（RTX 5080）：遊戲啟動約 15 秒後讓出（遊戲最高吃到 7.9 GB，總用量 10.5 GB）；閘道在遊戲期間完全沒搶 VRAM。
 
 刻意不做「偵測遊戲」：那要維護遊戲清單、掃描行程，而真正在意的其實是 VRAM 被搶——直接看 VRAM 更準，也涵蓋非遊戲的程式。
 
@@ -142,6 +144,7 @@ Breeze-ASR-25 本身幾乎不輸出標點（試過多種 prompt，最多換來�
 | `allowCidrs` | `"auto"`＝上述介面所在網段；也可寫成 CIDR 陣列 |
 | `allowRemote`、`idleMinutes`、`device`、`modelFile`、`punctuation`、`convertSimplified`、`vramGuard` | 由系統匣選單寫入 |
 | `vramGuardRiseMiB`、`vramGuardMinFreeMiB`、`vramGuardResumeSeconds` | 讓出 GPU 的門檻：其他程式增加多少 MiB（預設 1500）、剩餘低於多少 MiB（預設 1024）、回落後等幾秒才回到 GPU（預設 60） |
+| `vramGuardCpuModel` | 讓出 GPU 期間在 CPU 上用的模型檔（預設 `Qwen3-ASR-0.6B-Q8_0.gguf`，不存在就用原本的模型；空字串＝一律用原本的） |
 | `language` | 辨識語言：whisper 用代碼（`zh`），Qwen3-ASR 自動換成名稱（`Chinese`）；`auto` 為自動偵測 |
 | `prompt` | 只給 whisper 模型的提示詞 |
 | `llamaInstruction` | 給 Qwen3-ASR 系列的指示句（system prompt 第一行）；預設「以下是台灣人講的中文，夾雜英文術語時請保留英文原文；數字與型號請用阿拉伯數字。」 |

@@ -236,6 +236,7 @@ let ourMiB = 0; // VRAM our GPU backend took (measured); 0 = unknown, then estim
 let usedBeforeLoad = null;
 let otherSamples = []; // [{ at, other }] while not backed off
 let frozenBaseline = null; // reference kept while backed off
+let peakOther = null; // highest other-programs usage seen while backed off
 let vramBackedOff = false;
 let pressureSince = null;
 let calmSince = null;
@@ -271,9 +272,19 @@ async function measureOurVram() {
   if (v) ourMiB = Math.max(ourMiB, v.usedMiB - usedBeforeLoad);
 }
 
+// Smaller model for the CPU while the GPU is released (vramGuardCpuModel; "" = keep the configured
+// one). Measured during a game: Qwen3-ASR-1.7B on the CPU took 33 s to load and 6-7 s per sentence.
+function cpuFallbackModel() {
+  const file = cfg.vramGuardCpuModel === undefined ? "Qwen3-ASR-0.6B-Q8_0.gguf" : cfg.vramGuardCpuModel;
+  if (!file || file === cfg.modelFile || !fs.existsSync(path.join(modelsDir, file))) return null;
+  const m = describeModel(file);
+  return m && m.engine === currentModel().engine && (m.engine !== "llama" || m.mmproj) ? m : null;
+}
+
 function clearBackoff(reason) {
   vramBackedOff = false;
   frozenBaseline = null;
+  peakOther = null;
   calmSince = null;
   otherSamples = [];
   log(`VRAM guard: GPU available again (${reason})`);
@@ -305,14 +316,30 @@ async function guardTick() {
     if (now - pressureSince < GUARD.triggerMs || inFlight > 0) return;
     vramBackedOff = true;
     frozenBaseline = baseline;
+    peakOther = other;
     pressureSince = null;
     calmSince = null;
-    log(`VRAM guard: other programs +${rise} MiB, free ${free} MiB - releasing the GPU; dictation uses the CPU meanwhile`);
+    log(`VRAM guard: other programs ${baseline} -> ${other} MiB (+${rise}), free ${free} MiB - releasing the GPU; dictation uses the CPU meanwhile`);
     clearTimeout(idleTimer);
     idleDeadline = null;
     if (child) stopBackend("VRAM guard");
+    // With automatic unload off, have the CPU model ready once the game has finished loading.
+    if (!(cfg.idleMinutes > 0)) {
+      setTimeout(() => {
+        if (vramBackedOff && !child && !starting) {
+          log("preloading the CPU model while the GPU is released");
+          ensureBackend().then(armIdleTimer).catch((err) => log(`CPU preload failed: ${err.message}`));
+        }
+      }, 90000);
+    }
   } else {
-    const calm = other <= frozenBaseline + GUARD.resumeMarginMiB && free >= ourEstimate() + GUARD.minFreeMiB;
+    peakOther = Math.max(peakOther, other);
+    // Back once the extra usage is (mostly) gone: within the margin of the old reference, OR at least 70%
+    // of the jump released. The second test matters: overlays a game starts (NVIDIA Overlay, a bigger
+    // dwm) often stay resident after it exits, and small spikes from other windows must not keep
+    // restarting the 60-second wait (seen live: +581 of an 800 MiB margin delayed the return by 1m40s).
+    const released = other <= frozenBaseline + GUARD.resumeMarginMiB || other <= peakOther - 0.7 * (peakOther - frozenBaseline);
+    const calm = released && free >= ourEstimate() + GUARD.minFreeMiB;
     if (!calm) { calmSince = null; return; }
     calmSince = calmSince || now;
     if (now - calmSince >= GUARD.resumeMs && inFlight === 0) clearBackoff(`other programs back to +${other - frozenBaseline} MiB`);
@@ -369,6 +396,7 @@ let ready = false;
 let starting = null;
 let activeDevice = null;
 let activeEngine = null;
+let activeModelId = null;
 let inFlight = 0;
 let idleTimer = null;
 let idleDeadline = null;
@@ -403,14 +431,16 @@ function waitForReady(port, timeoutMs, healthCheck) {
 
 function startBackend(device) {
   const t0 = Date.now();
-  const model = currentModel();
   const useCpu = device === "cpu";
+  // While the GPU is released, the CPU runs a smaller sibling model if one is present (much faster there).
+  const model = (useCpu && vramBackedOff && cpuFallbackModel()) || currentModel();
+  const mPath = path.join(modelsDir, model.file);
   const kind = useCpu ? "cpu" : device === "vulkan" ? "vulkan" : "cuda";
   const exe = findEngine(model.engine, kind);
   const ffmpeg = findFfmpeg();
   if (!exe) return Promise.reject(new Error(`${model.engine} engine (${kind}) not found - see README`));
   if (!ffmpeg) return Promise.reject(new Error("ffmpeg not found - see README"));
-  if (!fs.existsSync(modelPath())) return Promise.reject(new Error(`model not found: ${modelPath()}`));
+  if (!fs.existsSync(mPath)) return Promise.reject(new Error(`model not found: ${mPath}`));
   if (model.engine === "llama" && !model.mmproj) return Promise.reject(new Error(`mmproj (audio encoder) for ${model.id} not found in models folder`));
   fs.mkdirSync(tmpDir, { recursive: true });
 
@@ -418,7 +448,7 @@ function startBackend(device) {
   let args;
   if (model.engine === "whisper") {
     args = [
-      "--model", modelPath(), "--host", "127.0.0.1", "--port", String(cfg.backendPort),
+      "--model", mPath, "--host", "127.0.0.1", "--port", String(cfg.backendPort),
       "--inference-path", "/v1/audio/transcriptions", "--convert", "--tmp-dir", tmpDir,
       "--language", cfg.language || "auto",
     ];
@@ -428,7 +458,7 @@ function startBackend(device) {
     else if (kind === "cuda") args.push("--device", device.split(":")[1]);
   } else {
     args = [
-      "-m", modelPath(), "--mmproj", path.join(modelsDir, model.mmproj), "--host", "127.0.0.1", "--port", String(cfg.backendPort),
+      "-m", mPath, "--mmproj", path.join(modelsDir, model.mmproj), "--host", "127.0.0.1", "--port", String(cfg.backendPort),
       "-c", String(cfg.llamaContext || 8192), "-np", "1", "--no-webui", "-ngl", useCpu ? "0" : "99", "-t", threads,
     ];
     if (useCpu) args.push("--device", "none"); // keeps a GPU build completely off the GPU
@@ -443,12 +473,13 @@ function startBackend(device) {
   const me = child;
   child.once("exit", (code) => {
     log(`${model.engine} server exited (code=${code})`);
-    if (child === me) { child = null; ready = false; activeDevice = null; activeEngine = null; }
+    if (child === me) { child = null; ready = false; activeDevice = null; activeEngine = null; activeModelId = null; }
   });
   return waitForReady(cfg.backendPort, useCpu ? 180000 : 120000, model.engine === "llama").then(() => {
     ready = true;
     activeDevice = device;
     activeEngine = model.engine;
+    activeModelId = model.id;
     chatUnreliable = false;
     if (!useCpu) setTimeout(measureOurVram, 5000);
     log(`${model.engine} server ready on ${device} (${model.id}) in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
@@ -506,6 +537,9 @@ function status() {
     convertSimplified: cfg.convertSimplified,
     vramGuard: cfg.vramGuard,
     backedOff: vramBackedOff,
+    activeModel: activeModelId,
+    guardBaseline: frozenBaseline,
+    guardPeak: peakOther,
     vram: lastVram,
     ourVramMiB: gpuBackendRunning() ? ourEstimate() : 0,
     vocabularyTerms: vocabulary.length,
