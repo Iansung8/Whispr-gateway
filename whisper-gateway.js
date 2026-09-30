@@ -745,14 +745,16 @@ let scriptDictState = "unloaded"; // unloaded | loading | ready | missing
 let s2t = null; // { map, maxLen, simplifiedOnly }
 let twVariants = null; // { map, maxLen }
 
-function parseDict(text) {
+// OpenCC files list alternatives separated by spaces (the first one is used); the user's lexicon keeps
+// the whole value so a replacement may contain spaces ("DLSS 五" -> "DLSS 5").
+function parseDict(text, wholeValue) {
   const map = new Map();
   let maxLen = 1;
   for (const line of text.split(/\r?\n/)) {
     if (!line || line.startsWith("#")) continue;
     const [key, values] = line.split("\t");
     if (!key || !values) continue;
-    map.set(key, values.split(" ")[0]);
+    map.set(key, wholeValue ? values.trim() : values.split(" ")[0]);
     if (key.length > maxLen) maxLen = key.length;
   }
   return { map, maxLen };
@@ -851,7 +853,7 @@ function loadLexicon() {
     if (!fs.existsSync(file)) { fs.mkdirSync(dataDir, { recursive: true }); fs.writeFileSync(file, LEXICON_DEFAULT, "utf8"); }
     const mtime = fs.statSync(file).mtimeMs;
     if (lexicon && mtime === lexiconMtime) return;
-    lexicon = parseDict(fs.readFileSync(file, "utf8"));
+    lexicon = parseDict(fs.readFileSync(file, "utf8"), true);
     lexiconMtime = mtime;
     log(`taiwan lexicon loaded (${lexicon.map.size} entries)`);
   } catch (err) { lexicon = null; log(`taiwan lexicon unavailable: ${err.message}`); }
