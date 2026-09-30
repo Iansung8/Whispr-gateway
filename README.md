@@ -115,7 +115,7 @@ Breeze-ASR-25 本身幾乎不輸出標點（試過多種 prompt，最多換來�
 
 開遊戲、LM Studio 或 Stable Diffusion 這類吃 VRAM 的程式時，閘道可以自動把模型從 GPU 卸下，讓給它們：
 
-- 判斷依據是「**有沒有別的程式，自己一個就佔了一大塊 VRAM**」：每 10 秒用 Windows 內建的 `typeperf` 讀「GPU Process Memory」計數器（約 1 秒、幾乎不耗 CPU）。任何單一程式 ≥ 2 GB（`vramGuardProcessMiB`）且連續兩次都在 → 卸載模型、讓出 GPU，系統匣會顯示是誰（例如「Endfield 佔用 7.9 GB」）。遊戲通常 4–8 GB；桌面上的程式各自都不到 1 GB。`dwm`（桌面合成，計數器本身也不準）預設忽略，可用 `vramGuardIgnore`（正規表示式）加名單。
+- 判斷依據是「**有沒有別的程式，自己一個就佔了一大塊 VRAM**」：每 10 秒用 Windows 內建的 `typeperf` 讀「GPU Process Memory」計數器（約 1 秒、幾乎不耗 CPU）。任何單一程式 ≥ 2 GB（`vramGuardProcessMiB`）且連續兩次都在 → 卸載模型、讓出 GPU，系統匣會顯示是誰（例如「Endfield 佔用 7.9 GB」）。遊戲通常 4–8 GB；桌面上的程式各自都不到 1 GB。`dwm`（桌面合成，計數器本身也不準）和 NVIDIA 的 Overlay 預設忽略——Overlay 掛進遊戲時自己會漲到 2.5 GB，實測《崩壞：星穹鐵道》本身只用 1.5 GB、還剩 9.6 GB，卻因為 Overlay 被當成大戶；其他不該算的程式用 `vramGuardIgnore`（正規表示式）追加。
 - 另一個觸發條件：剩餘 VRAM < 1 GB（`vramGuardMinFreeMiB`）持續 10 秒。
 - 讓出期間聽寫**改用 CPU**（不碰 VRAM），而且改用較小的模型（`vramGuardCpuModel`，預設 `Qwen3-ASR-0.6B-Q8_0.gguf`，檔案在才用）；設「不自動卸載」時，讓出 90 秒後（遊戲載入完）先把 CPU 模型預載好。實戰量到：遊戲載入中用 1.7B 跑 CPU，第一句要 39 秒。
 - 那個大戶不在了、剩餘 VRAM 也夠放回模型，持續 60 秒（`vramGuardResumeSeconds`）→ 回到 GPU；若設「不自動卸載」會自動重新載入。
@@ -146,7 +146,7 @@ Breeze-ASR-25 本身幾乎不輸出標點（試過多種 prompt，最多換來�
 | `allowCidrs` | `"auto"`＝上述介面所在網段；也可寫成 CIDR 陣列 |
 | `allowRemote`、`idleMinutes`、`device`、`modelFile`、`punctuation`、`convertSimplified`、`vramGuard` | 由系統匣選單寫入 |
 | `vramGuardProcessMiB`、`vramGuardMinFreeMiB`、`vramGuardResumeSeconds` | 讓出 GPU 的門檻：單一程式佔用多少 MiB 算大戶（預設 2000）、剩餘低於多少 MiB（預設 1024）、大戶離開後等幾秒才回到 GPU（預設 60） |
-| `vramGuardIgnore` | 不算大戶的程式名稱（正規表示式，不含 .exe），預設 `^(dwm|csrss|system|idle)$` |
+| `vramGuardIgnore` | **額外**不算大戶的程式名稱（正規表示式，不含 .exe，例如 `^(chrome|obs64)$`）。內建名單 `dwm`、`csrss`、`NVIDIA Overlay`、`NVIDIA Share`、`NVIDIA app`、`nvcontainer` 一律忽略 |
 | `vramGuardCpuModel` | 讓出 GPU 期間在 CPU 上用的模型檔（預設 `Qwen3-ASR-0.6B-Q8_0.gguf`，不存在就用原本的模型；空字串＝一律用原本的） |
 | `language` | 辨識語言：whisper 用代碼（`zh`），Qwen3-ASR 自動換成名稱（`Chinese`）；`auto` 為自動偵測 |
 | `prompt` | 只給 whisper 模型的提示詞 |

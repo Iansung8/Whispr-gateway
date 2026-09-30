@@ -14,7 +14,7 @@ while true; do
   fi
   [ $down -eq 1 ] && echo "[$(date +%H:%M:%S)] gateway responding again"
   down=0
-  read -r state used total ours <<< "$(echo "$s" | python -c "import json,sys;s=json.load(sys.stdin);v=s.get('vram') or {};print('%s/%s/%s/backedOff=%s/hog=%s' % (s['backend'],s['activeDevice'],s.get('activeModel') or '-',s['backedOff'],((s.get('guardHog') or {}).get('name','-')+':'+str((s.get('guardHog') or {}).get('mib',''))).replace(' ','_')), v.get('usedMiB',0), v.get('totalMiB',0), s.get('ourVramMiB',0))")"
+  read -r state used total ours <<< "$(echo "$s" | python -c "import json,sys;s=json.load(sys.stdin);v=s.get('vram') or {};print('%s/%s/%s/backedOff=%s/hog=%s' % (s['backend'],s['activeDevice'],s.get('activeModel') or '-',s['backedOff'],(s.get('guardHog') or {}).get('name','-').replace(' ','_')), v.get('usedMiB',0), v.get('totalMiB',0), s.get('ourVramMiB',0))")"
   now=$(date +%s)
   if [ "$state" != "$prev" ]; then
     echo "[$(date +%H:%M:%S)] STATE $state | VRAM ${used}/${total} MiB (ours ${ours})"

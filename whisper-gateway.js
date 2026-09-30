@@ -226,9 +226,17 @@ function refreshGpus() {
 // it with 11 GB still free, and overlays a game leaves behind kept it from coming back. No game list is
 // needed either way. Running truly low on free VRAM is kept as a second trigger.
 if (typeof cfg.vramGuard !== "boolean") cfg.vramGuard = false;
+// Never a reason to back off: the desktop itself (dwm's counter is inflated anyway) and NVIDIA's overlay,
+// whose main process grows to 2.5 GB when it hooks a game that itself needs only 1.5 GB (seen with
+// StarRail: 9.6 GB free, yet dictation sat on the CPU for an hour). vramGuardIgnore adds to this list.
+const GUARD_IGNORE = "^(dwm|csrss|system|idle|nvidia overlay|nvidia share|nvidia app|nvcontainer)$";
+function guardIgnore() {
+  try { return new RegExp(cfg.vramGuardIgnore ? `${GUARD_IGNORE}|${cfg.vramGuardIgnore}` : GUARD_IGNORE, "i"); }
+  catch (err) { log(`vramGuardIgnore is not a valid regular expression (${err.message}) - ignored`); return new RegExp(GUARD_IGNORE, "i"); }
+}
 const GUARD = {
   processMiB: Number(cfg.vramGuardProcessMiB) || 2000,
-  ignore: new RegExp(cfg.vramGuardIgnore || "^(dwm|csrss|system|idle)$", "i"), // dwm's counter is inflated and it is the desktop itself
+  ignore: guardIgnore(),
   minFreeMiB: Number(cfg.vramGuardMinFreeMiB) || 1024,
   triggerMs: 10000,
   resumeMs: (Number(cfg.vramGuardResumeSeconds) || 60) * 1000,
