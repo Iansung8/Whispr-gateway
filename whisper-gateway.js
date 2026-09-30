@@ -220,15 +220,12 @@ function refreshGpus() {
 // left for a while the GPU is used again (and the model preloaded if automatic unload is off).
 //
 // The signal is per-process dedicated GPU memory from Windows' "GPU Process Memory" counters (read with
-// typeperf, ~1 s, negligible CPU): a game shows up as one process with 4-8 GB, while everyday desktop
-// programs stay under 1 GB each. An earlier version looked at the rise of TOTAL usage instead and got
-// both directions wrong in real use: the desktop waking up (+1.9 GB across dwm/browser/player) tripped
-// it with 11 GB still free, and overlays a game leaves behind kept it from coming back. No game list is
-// needed either way. Running truly low on free VRAM is kept as a second trigger.
+// typeperf, ~1 s, negligible CPU): a game shows up as one process with several GB, while everyday
+// desktop programs stay under 1 GB each, so no game list is needed. Total usage is not used as the
+// signal because it also moves when the desktop wakes up. Running low on free VRAM is a second trigger.
 if (typeof cfg.vramGuard !== "boolean") cfg.vramGuard = false;
-// Never a reason to back off: the desktop itself (dwm's counter is inflated anyway) and NVIDIA's overlay,
-// whose main process grows to 2.5 GB when it hooks a game that itself needs only 1.5 GB (seen with
-// StarRail: 9.6 GB free, yet dictation sat on the CPU for an hour). vramGuardIgnore adds to this list.
+// Never a reason to back off: the desktop itself (dwm's counter is inflated) and NVIDIA's overlay, which
+// grows past the threshold by itself when it hooks a game. vramGuardIgnore adds to this list.
 const GUARD_IGNORE = "^(dwm|csrss|system|idle|nvidia overlay|nvidia share|nvidia app|nvcontainer)$";
 function guardIgnore() {
   try { return new RegExp(cfg.vramGuardIgnore ? `${GUARD_IGNORE}|${cfg.vramGuardIgnore}` : GUARD_IGNORE, "i"); }
@@ -286,11 +283,8 @@ async function measureOurVram() {
 }
 
 // Model for the CPU while the GPU is released (vramGuardCpuModel; "" = keep the configured one).
-// Default: the first of these that is in the models folder. Measured on 203 real dictation clips
-// (error rate / English terms found / seconds for a 17 s utterance on an idle i5-13600K):
-//   Qwen3-ASR-1.7B Q8      1.8 % / 83 % / 4.2 s      Qwen3-ASR-1.7B Q4_K_M  2.2 % / 82 % / 2.8 s
-//   Qwen3-ASR-0.6B Q8      3.7 % / 75 % / 1.8 s
-// so the 4-bit 1.7B keeps nearly all of the accuracy for one more second; the 0.6B is the fast option.
+// Default: the first of these that is in the models folder. The 4-bit 1.7B keeps nearly all of the
+// accuracy at about 1.5x the 0.6B's time; the 0.6B is the fast option (docs/asr-model-comparison.md).
 const CPU_FALLBACKS = ["Qwen3-ASR-1.7B.Q4_K_M.gguf", "Qwen3-ASR-0.6B-Q8_0.gguf"];
 function cpuFallbackModel() {
   const file = cfg.vramGuardCpuModel === undefined
@@ -717,12 +711,9 @@ function tidy(text) {
 }
 
 // -- acronyms and numbers --
-// The two things that read worst in Qwen3-ASR's output: acronyms spelled out ("G P U", "N V I D I A")
-// and numbers left as Chinese numerals ("RTX 五零八零", "DLSS 五", "十六 GB", "三十秒"). Measured on 203
-// real dictation clips: 33 spelled-out runs in 20 clips and 70 multi-character numeral runs. No
-// vocabulary can list every term, so both are put right here. Numbers are converted only where they
-// can hardly be anything else; counting words stay as they are (一個, 兩顆, 一點, 兩兩, 萬一, 十分, 一二三).
-//#tidyLatin-begin
+// Qwen3-ASR often spells acronyms out ("G P U", "N V I D I A") and leaves numbers as Chinese numerals
+// ("RTX 五零八零", "DLSS 五", "十六 GB", "三十秒"). Both are put right here. Numbers are converted only
+// where they can hardly be anything else; counting words stay (一個, 兩顆, 一點, 兩兩, 萬一, 十分, 一二三).
 const CN_DIGIT = { 零: 0, 〇: 0, 一: 1, 二: 2, 兩: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9 };
 const CN_D = "零〇一二三四五六七八九"; // read digit by digit
 const CN_N = CN_D + "兩十百千萬"; // everything a number can contain
@@ -789,7 +780,6 @@ function tidyLatin(text) {
     .replace(/百分之(\d+(?:\.\d+)?)/g, "$1%")
     .replace(/(\d)槓(\d)/g, "$1-$2"); // "十七槓四 PH" -> "17-4PH"
 }
-//#tidyLatin-end
 
 // -- punctuation from whisper segments --
 // Breeze-ASR-25 emits next to no punctuation, but with timestamps on its segments break exactly at
@@ -971,14 +961,9 @@ function loadVocabulary() {
   } catch (err) { vocabulary = []; log(`vocabulary hint unavailable: ${err.message}`); }
 }
 // General tech terms that go out after the user's own words (builtinVocabulary: false turns them off),
-// so nobody has to type "VRAM" or "repo" into a file. Measured on 203 real dictation clips: English
-// terms found 83 % -> 88 % ("repo" 3/12 -> 12/12, "VRAM" 0/4 -> 4/4). What the measurements also say:
-//  - only terms the model gets wrong on its own belong here. A listed term pulls similar-sounding
-//    words towards it: with "AI" listed a lecturer's "RL" became "AI", with "PCIe" listed "PCH"
-//    became "PCIe" - so no GPU/CPU/AI/API/PR/PCIe, which the model writes correctly anyway;
-//  - more is not better: 100 and 300 terms found nothing more and 300 made short clips come back empty;
-//  - it is no cure-all: "session" is listed and still comes out as "season" every time, and on lecture
-//    audio about other subjects the list costs a little accuracy (4.4 % -> 4.9 % error).
+// so nobody has to type "VRAM" or "repo" into a file. Only terms the model gets wrong on its own belong
+// here: a listed term pulls similar-sounding words towards it ("AI" turned "RL" into "AI"), and past
+// about 50 terms nothing more is gained while very long lists make short clips come back empty.
 const BUILTIN_VOCABULARY = ["VRAM", "NVIDIA", "RTX", "DLSS", "CUDA", "Vulkan", "NAS", "Wi-Fi", "LLM", "agent", "repo", "commit",
   "merge", "branch", "main", "README", "session", "GitHub", "Docker", "Python", "Claude", "GPT", "Codex", "Opus", "Gemini", "Ollama",
   "llama.cpp", "Whisper", "OpenWhispr", "ZeroTier", "Windows", "Linux", "macOS", "Chrome", "VS Code"];
@@ -1106,10 +1091,9 @@ async function transcribeWhisper(body, contentType) {
 // llama-server (Qwen3-ASR family): wav in, model chatter and Simplified script out.
 // Two ways to ask the model: the chat endpoint (takes the vocabulary hint; preferred) and the plain
 // transcription endpoint (no hint). Fine-tunes such as TEA-ASR stop right after the language tag on
-// the chat endpoint; handing that tag back as the start of the answer ("prefill") makes them go on.
-// Measured on 126 lecture clips: TEA-ASR-1.1 through the transcription endpoint left 51 empty and
-// echoed the endpoint's own instruction in others (45 % error); with the prefill, 0 empty and 2.8 %.
-// For Qwen3-ASR itself the prefill changes nothing. The plain endpoint stays as the last resort.
+// the chat endpoint; handing that tag back as the start of the answer ("prefill") makes them go on
+// (the transcription endpoint leaves many TEA-ASR results empty). For Qwen3-ASR itself the prefill
+// changes nothing. The plain endpoint stays as the last resort.
 let chatNeedsPrefill = false; // set on the first tag-only reply, cleared when a backend loads
 let chatUnreliable = false;
 

@@ -11,7 +11,7 @@
 
 ## 推薦：Qwen3-ASR-1.7B（阿里官方，輸出簡體 → 閘道自動轉台灣繁體）
 
-[ggml-org/Qwen3-ASR-1.7B-GGUF](https://huggingface.co/ggml-org/Qwen3-ASR-1.7B-GGUF)（Apache-2.0；30 種語言＋22 種漢語方言／口音）。用 203 段真實的台灣腔聽寫錄音實測，它是比過的模型裡最準的（見 [docs/asr-model-comparison.md](../docs/asr-model-comparison.md)）。建議放兩個檔：**Q8 給 GPU**、**Q4_K_M 給 CPU 備援**（讓出 GPU 時自動改用；4-bit 幾乎不掉準確度，CPU 上快 1.5 倍）。兩者共用同一個 mmproj。
+[ggml-org/Qwen3-ASR-1.7B-GGUF](https://huggingface.co/ggml-org/Qwen3-ASR-1.7B-GGUF)（Apache-2.0；30 種語言＋22 種漢語方言／口音）。建議放兩個檔：**Q8 給 GPU**、**Q4_K_M 給 CPU 備援**（讓出 GPU 時自動改用），兩者共用同一個 mmproj。實測比較見 [docs/asr-model-comparison.md](../docs/asr-model-comparison.md)。
 
 ```powershell
 curl.exe -L --fail --retry 5 -C - -o Qwen3-ASR-1.7B-Q8_0.gguf "https://huggingface.co/ggml-org/Qwen3-ASR-1.7B-GGUF/resolve/main/Qwen3-ASR-1.7B-Q8_0.gguf"
@@ -34,7 +34,7 @@ Qwen3-ASR-0.6B（[ggml-org/Qwen3-ASR-0.6B-GGUF](https://huggingface.co/ggml-org/
 
 ## TEA-ASR-1.1（台灣華語，原生繁體＋台灣用字，MIT）
 
-[JacobLinCool/TEA-ASR-1.1](https://huggingface.co/JacobLinCool/TEA-ASR-1.1)：Qwen3-ASR-1.7B 以不到 10 小時的台灣公開語料微調（CommonVoice zh-TW、ASCEND、NTUML2021、TaiMECS），保留原本的多語能力。作者公布的錯誤率（%）：CommonVoice zh-TW **3.58**（Qwen3-ASR-1.7B 3.90、Breeze-ASR-25 8.03、Whisper-large-v3 10.17）、ASCEND 中英夾雜 **9.60**（10.57／17.53／19.61）、NTUML2021 課堂 **6.67**（10.12／7.50／9.68）。我們自己的實測：課堂錄音上它明顯比原版 Qwen3-ASR-1.7B 準（錯字率 2.8% 對 4.4%），個人聽寫上兩者相當（盲測 14 比 20）。GGUF 由 mradermacher 量化：
+[JacobLinCool/TEA-ASR-1.1](https://huggingface.co/JacobLinCool/TEA-ASR-1.1)：Qwen3-ASR-1.7B 以不到 10 小時的台灣公開語料微調（CommonVoice zh-TW、ASCEND、NTUML2021、TaiMECS），保留原本的多語能力。作者公布的錯誤率（%）：CommonVoice zh-TW **3.58**（Qwen3-ASR-1.7B 3.90、Breeze-ASR-25 8.03、Whisper-large-v3 10.17）、ASCEND 中英夾雜 **9.60**（10.57／17.53／19.61）、NTUML2021 課堂 **6.67**（10.12／7.50／9.68）。GGUF 由 mradermacher 量化：
 
 ```powershell
 curl.exe -L --fail --retry 5 -C - -o TEA-ASR-1.1.Q6_K.gguf "https://huggingface.co/mradermacher/TEA-ASR-1.1-GGUF/resolve/main/TEA-ASR-1.1.Q6_K.gguf"
