@@ -83,7 +83,7 @@ WhisprGateway.exe = 系統匣圖示（語）：看管閘道 + 手動控制
 | OpenWhispr 要填什麼… | 顯示端點網址，可一鍵複製 |
 | 開機（登入）時自動啟動 | 建立／刪除工作排程器的 `WhisprGateway` 工作（登入後延遲 20 秒啟動，不需要系統管理員），並附一個每 5 分鐘的看門狗：程式被關掉或當掉時自動拉回來（已在執行時什麼都不做）。可用 `schtasks /Run /TN WhisprGateway` 當場測試；資料夾搬動後，下次執行 exe 會自動把工作指到新位置 |
 
-圖示顏色：綠＝已載入、橘＝載入中、灰＝未載入、紅＝閘道沒回應。
+圖示顏色：綠＝模型在 GPU 上、**藍＝目前用 CPU 辨識**（已讓出 GPU 給遊戲，或裝置選了 CPU）、橘＝載入中、灰＝未載入、紅＝閘道沒回應。
 
 ## 效能
 
@@ -162,7 +162,7 @@ Breeze-ASR-25 本身幾乎不輸出標點（試過多種 prompt，最多換來�
 
 - [docs/openwhispr-notes.md](docs/openwhispr-notes.md)：做這個專案時整理的 OpenWhispr 1.9.1 行為筆記（固定模型槽位、GPU 失敗旗標、Vulkan 裝置釘選、自架模式的請求格式、OpenCC twp 改詞…）。
 - `tools\`：離線測試腳本（用 Windows 內建 TTS 合成測試音檔）。
-- `src\GatewayTray.cs`：系統匣程式原始碼（C# 5 語法）。重編前要先結束 exe；開著自動啟動時，看門狗會在 5 分鐘內把它拉回來而鎖住檔案，所以先 `schtasks /Change /TN WhisprGateway /DISABLE`，編完再 `/ENABLE` 和 `/Run`。`WhisprGateway.exe --render-info out.png` 可把資訊視窗畫成圖檢查版面。
+- `src\GatewayTray.cs`：系統匣程式原始碼（C# 5 語法）。重編前要先結束 exe；開著自動啟動時，看門狗會在 5 分鐘內把它拉回來而鎖住檔案，所以先 `schtasks /Change /TN WhisprGateway /DISABLE`，編完再 `/ENABLE` 和 `/Run`。`WhisprGateway.exe --render-info out.png` 可把資訊視窗畫成圖檢查版面，`--render-icons out.png` 則把五種狀態的圖示畫成一張圖。
 - 已知限制：僅 Windows；自啟動是「登入時」而非開機未登入時；重開機後第一次載入模型較慢；whisper-server 的 `--prompt` 在 Windows 會被 ANSI code page 弄壞，所以中文 prompt 由閘道以 UTF-8 multipart 欄位注入；Qwen3-ASR 回覆開頭的 `language Chinese<asr_text>` 標記由閘道去掉。
 
 ## 致謝

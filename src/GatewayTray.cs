@@ -57,6 +57,25 @@ namespace WhisprGateway
                 return 0;
             }
 
+            // Debug aid: render the tray icons (large and at tray size) to a PNG, in the order of IconColors.
+            int renderIcons = Array.IndexOf(args, "--render-icons");
+            if (renderIcons >= 0 && renderIcons + 1 < args.Length)
+            {
+                using (Bitmap bmp = new Bitmap(TrayApp.IconColors.Length * 56, 64))
+                using (Graphics g = Graphics.FromImage(bmp))
+                {
+                    g.Clear(Color.FromArgb(32, 32, 32));
+                    for (int i = 0; i < TrayApp.IconColors.Length; i++)
+                        using (Icon icon = TrayApp.MakeIcon(TrayApp.IconColors[i].Value))
+                        {
+                            g.DrawIcon(icon, new Rectangle(i * 56 + 4, 4, 32, 32));
+                            g.DrawIcon(icon, new Rectangle(i * 56 + 12, 42, 16, 16));
+                        }
+                    bmp.Save(args[renderIcons + 1], System.Drawing.Imaging.ImageFormat.Png);
+                }
+                return 0;
+            }
+
             bool createdNew;
             using (Mutex mutex = new Mutex(true, "Local\\WhisprGatewayTray", out createdNew))
             {
@@ -219,10 +238,7 @@ namespace WhisprGateway
             string models = Environment.ExpandEnvironmentVariables(cfg.ContainsKey("modelsDir") ? Convert.ToString(cfg["modelsDir"]) : "models");
             modelsDir = Path.IsPathRooted(models) ? models : Path.Combine(hostDir, models);
 
-            icons["loaded"] = MakeIcon(Color.FromArgb(34, 160, 80));
-            icons["loading"] = MakeIcon(Color.FromArgb(230, 140, 20));
-            icons["unloaded"] = MakeIcon(Color.FromArgb(120, 120, 120));
-            icons["down"] = MakeIcon(Color.FromArgb(200, 50, 50));
+            foreach (KeyValuePair<string, Color> c in IconColors) icons[c.Key] = MakeIcon(c.Value);
 
             BuildMenu();
             notify.Icon = icons["down"];
@@ -483,7 +499,9 @@ namespace WhisprGateway
                 label = "已讓出 GPU（" + why + "）" + (backend == "loaded" ? "・CPU 模型已載入" : "・需要時用 CPU");
             }
 
-            notify.Icon = icons.ContainsKey(backend) ? icons[backend] : icons["unloaded"];
+            // Blue whenever dictation is on the CPU: GPU released to a game (loaded or not), or CPU is the chosen device.
+            string iconKey = backend == "loading" ? "loading" : backedOff || (backend == "loaded" && active == "cpu") ? "cpu" : backend;
+            notify.Icon = icons.ContainsKey(iconKey) ? icons[iconKey] : icons["unloaded"];
             SetTip("語音辨識閘道：" + label);
             miStatus.Text = "狀態：" + label;
 
@@ -613,7 +631,16 @@ namespace WhisprGateway
             catch { return null; }
         }
 
-        static Icon MakeIcon(Color color)
+        // green = model on the GPU, blue = dictation runs on the CPU, orange = loading, grey = nothing loaded, red = gateway down
+        internal static readonly KeyValuePair<string, Color>[] IconColors = {
+            new KeyValuePair<string, Color>("loaded", Color.FromArgb(34, 160, 80)),
+            new KeyValuePair<string, Color>("cpu", Color.FromArgb(40, 120, 215)),
+            new KeyValuePair<string, Color>("loading", Color.FromArgb(230, 140, 20)),
+            new KeyValuePair<string, Color>("unloaded", Color.FromArgb(120, 120, 120)),
+            new KeyValuePair<string, Color>("down", Color.FromArgb(200, 50, 50)),
+        };
+
+        internal static Icon MakeIcon(Color color)
         {
             using (Bitmap bmp = new Bitmap(32, 32))
             using (Graphics g = Graphics.FromImage(bmp))
