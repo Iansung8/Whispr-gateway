@@ -285,10 +285,17 @@ async function measureOurVram() {
   if (v) ourMiB = Math.max(ourMiB, v.usedMiB - usedBeforeLoad);
 }
 
-// Smaller model for the CPU while the GPU is released (vramGuardCpuModel; "" = keep the configured
-// one). Measured during a game: Qwen3-ASR-1.7B on the CPU took 33 s to load and 6-7 s per sentence.
+// Model for the CPU while the GPU is released (vramGuardCpuModel; "" = keep the configured one).
+// Default: the first of these that is in the models folder. Measured on 203 real dictation clips
+// (error rate / English terms found / seconds for a 17 s utterance on an idle i5-13600K):
+//   Qwen3-ASR-1.7B Q8      1.8 % / 83 % / 4.2 s      Qwen3-ASR-1.7B Q4_K_M  2.2 % / 82 % / 2.8 s
+//   Qwen3-ASR-0.6B Q8      3.7 % / 75 % / 1.8 s
+// so the 4-bit 1.7B keeps nearly all of the accuracy for one more second; the 0.6B is the fast option.
+const CPU_FALLBACKS = ["Qwen3-ASR-1.7B.Q4_K_M.gguf", "Qwen3-ASR-0.6B-Q8_0.gguf"];
 function cpuFallbackModel() {
-  const file = cfg.vramGuardCpuModel === undefined ? "Qwen3-ASR-0.6B-Q8_0.gguf" : cfg.vramGuardCpuModel;
+  const file = cfg.vramGuardCpuModel === undefined
+    ? CPU_FALLBACKS.find((f) => f !== cfg.modelFile && fs.existsSync(path.join(modelsDir, f)))
+    : cfg.vramGuardCpuModel;
   if (!file || file === cfg.modelFile || !fs.existsSync(path.join(modelsDir, file))) return null;
   const m = describeModel(file);
   return m && m.engine === currentModel().engine && (m.engine !== "llama" || m.mmproj) ? m : null;
@@ -543,8 +550,9 @@ function startBackend(device) {
     activeEngine = model.engine;
     activeModelId = model.id;
     chatUnreliable = false;
+    chatNeedsPrefill = false;
     if (!useCpu) setTimeout(measureOurVram, 5000);
-    log(`${model.engine} server ready on ${device} (${model.id}) in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+    log(`${model.engine} server ready on ${device} (${model.file === cfg.modelFile ? model.id : model.file}) in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
   });
 }
 
@@ -605,6 +613,7 @@ function status() {
     vram: lastVram,
     ourVramMiB: gpuBackendRunning() ? ourEstimate() : 0,
     vocabularyTerms: vocabulary.length,
+    vocabularySent: vocabularyTerms().length, // the user's words plus the built-in ones, after the cap
     vocabularyFile: path.join(dataDir, "vocabulary.txt"),
     lexiconFile: path.join(dataDir, "taiwan-lexicon.txt"),
     listening: [...listening.keys()],
@@ -706,6 +715,81 @@ function tidy(text) {
     .replace(new RegExp(`(?<=[${CJK}])!`, "g"), "！")
     .trim();
 }
+
+// -- acronyms and numbers --
+// The two things that read worst in Qwen3-ASR's output: acronyms spelled out ("G P U", "N V I D I A")
+// and numbers left as Chinese numerals ("RTX 五零八零", "DLSS 五", "十六 GB", "三十秒"). Measured on 203
+// real dictation clips: 33 spelled-out runs in 20 clips and 70 multi-character numeral runs. No
+// vocabulary can list every term, so both are put right here. Numbers are converted only where they
+// can hardly be anything else; counting words stay as they are (一個, 兩顆, 一點, 兩兩, 萬一, 十分, 一二三).
+//#tidyLatin-begin
+const CN_DIGIT = { 零: 0, 〇: 0, 一: 1, 二: 2, 兩: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9 };
+const CN_D = "零〇一二三四五六七八九"; // read digit by digit
+const CN_N = CN_D + "兩十百千萬"; // everything a number can contain
+const CN_SECTION = "(?:[一二兩三四五六七八九]千)?(?:[零〇]?[一二兩三四五六七八九]百)?(?:[零〇]?[一二三四五六七八九]?十)?(?:[零〇]?[一二三四五六七八九])?";
+const CN_UNIT_NUMBER = new RegExp(`^(?:(${CN_SECTION})萬)?(${CN_SECTION})$`);
+const cnDigits = (s) => s.replace(new RegExp(`[${CN_D}]`, "g"), (c) => CN_DIGIT[c]);
+function cnSection(s) { // "三千零八十" -> 3080
+  let total = 0, digit = 0, sawDigit = false;
+  for (const c of s) {
+    if (c in CN_DIGIT) { digit = CN_DIGIT[c]; sawDigit = true; continue; }
+    total += (sawDigit ? digit : 1) * { 十: 10, 百: 100, 千: 1000 }[c];
+    digit = 0; sawDigit = false;
+  }
+  return total + digit;
+}
+// A numeral run as digits, or null when it is not clearly a number. `model` = it stands next to a Latin
+// word, where a bare digit sequence is a model number ("PR 四三"); elsewhere such a sequence needs three
+// digits and must not be someone counting ("一二三").
+function cnNumber(s, model) {
+  if (new RegExp(`^[${CN_D}]+點[${CN_D}]+$`).test(s)) return cnDigits(s).replace("點", "."); // 五點五 -> 5.5
+  if (new RegExp(`^[${CN_D}]+$`).test(s)) return !s.startsWith("一二三") && (model || s.length >= 3) ? cnDigits(s) : null; // 五零八零 -> 5080
+  if (/[十百千萬]/.test(s)) {
+    const m = CN_UNIT_NUMBER.exec(s);
+    if (m && (m[1] === undefined || m[1])) { // 三十五 -> 35, 十五萬 -> 15萬, 一萬兩千 -> 12000
+      const low = cnSection(m[2]);
+      return m[1] && !low ? `${cnSection(m[1])}萬` : String((m[1] ? cnSection(m[1]) * 10000 : 0) + low);
+    }
+  }
+  if (model) { // a version and a size said in one breath: "三點八二十七 B" -> "3.8 27B"
+    const m = new RegExp(`^([${CN_D}]+點[${CN_D}])(.{2,})$`).exec(s);
+    const rest = m && cnNumber(m[2], false);
+    if (rest) return `${cnDigits(m[1]).replace("點", ".")} ${rest}`;
+  }
+  return null;
+}
+const MEASURE = "個種張臺台顆次下些邊天年月號件篇頁組項條份段句層步樣直起定共般路遍堆刻致併";
+function tidyLatin(text) {
+  const run = `[${CN_N}點]+`;
+  const notInRun = `(?![${CN_N}點])`;
+  return String(text || "")
+    // "G P U" -> "GPU", "N V I D I A" -> "NVIDIA", "A I" -> "AI": letters said one by one are one acronym
+    .replace(/(?<![A-Za-z])(?:[A-Za-z] ){2,}[A-Za-z](?![A-Za-z])/g, (m) => m.replace(/ /g, "").toUpperCase())
+    .replace(/(?<![A-Za-z])(?:[A-Z] [A-Z]|k V)(?![A-Za-z])/g, (m) => m.replace(" ", ""))
+    // right after a Latin word it is a model or version number: "RTX 五零八零" -> "RTX 5080", "DLSS 五" -> "DLSS 5",
+    // "A 七七零" -> "A770". One numeral alone counts only if no measure word follows ("GPU 五個" stays) and never 一/兩/十.
+    .replace(new RegExp(`([A-Za-z]+)( ?)(${run})${notInRun}(?=(.?))`, "g"), (m, word, sp, num, next) => {
+      const n = num.length === 1 ? ("一兩十百千萬點".includes(num) || (next && MEASURE.includes(next)) ? null : cnDigits(num)) : cnNumber(num, true);
+      return n === null ? m : word + (word.length === 1 ? "" : sp) + n;
+    })
+    // right before a Latin unit: "十六 GB" -> "16 GB", "二十 kV" -> "20 kV", "二十七 B" -> "27B"
+    .replace(new RegExp(`(?<![${CN_N}點第])(${run})( ?)(?=([A-Za-z]+))`, "g"), (m, num, sp, unit) => {
+      const n = num.length === 1 ? ("一兩十百千萬點".includes(num) ? null : cnDigits(num)) : cnNumber(num, true);
+      return n === null ? m : n + (unit.length === 1 ? "" : sp);
+    })
+    // dates and clock times keep both halves in the same script: "九月十一號" -> "9月11號", "三點二十分" -> "3點20分"
+    .replace(new RegExp(`(?<![${CN_N}])([一二三四五六七八九十]{1,2})月([一二三四五六七八九十]{1,3})(號|日)`, "g"), (m, mo, d, unit) => `${cnSection(mo)}月${cnSection(d)}${unit}`)
+    .replace(new RegExp(`(?<![${CN_N}])([一二兩三四五六七八九十]{1,2})點([一二三四五六七八九十]{1,3})分`, "g"), (m, h, mi) => `${cnSection(h)}點${cnSection(mi)}分`)
+    // anywhere else, only numbers of two numerals or more: "三十秒" -> "30秒", "一百美金" -> "100美金", "七七零" -> "770"
+    .replace(new RegExp(`(?<![${CN_N}點])(${run})(?![${CN_N}點幾多])`, "g"), (m, num, offset, whole) => {
+      if (num.length < 2) return m;
+      const n = cnNumber(num, false);
+      return n === null || (n.includes(".") && whole[offset - 1] === "第") ? m : n; // "第三點一" is a list item, not 3.1
+    })
+    .replace(/百分之(\d+(?:\.\d+)?)/g, "$1%")
+    .replace(/(\d)槓(\d)/g, "$1-$2"); // "十七槓四 PH" -> "17-4PH"
+}
+//#tidyLatin-end
 
 // -- punctuation from whisper segments --
 // Breeze-ASR-25 emits next to no punctuation, but with timestamps on its segments break exactly at
@@ -823,6 +907,7 @@ function toTraditional(text) {
 // Qwen3-ASR replies "language Chinese<asr_text>..." (fine-tunes such as TEA-ASR drop the tag and
 // leave just "language Chinese") - either way the prefix is model chatter, not transcript.
 const stripAsrTag = (text) => String(text || "")
+  .replace(/[-]/g, "") // TEA-ASR's marker tokens come through llama.cpp as private-use characters
   .replace(/^\s*language\s+[A-Za-z]+(\s*<asr_text>)?\s*/i, "")
   .replace(/^[\s。，、；：！？,.;:!?]+/, ""); // TEA-ASR sometimes puts a stray mark where the tag was
 
@@ -866,20 +951,11 @@ const applyLexicon = (text) => { loadLexicon(); return lexicon && lexicon.map.si
 // so the gateway talks to the model through /v1/chat/completions with the instruction + the words in
 // data\vocabulary.txt as the system message. This is the replacement for OpenWhispr's custom
 // dictionary, which its self-hosted mode never sends.
-const VOCABULARY_DEFAULT = `# 詞彙提示：一行一個詞（英文術語、人名、專有名詞）。模型辨識時會參考，講台灣腔英文也比較能寫回英文。
-# Vocabulary hint for Qwen3-ASR family models: one term per line; # starts a comment. Edit freely.
-CUDA
-Vulkan
-GPU
-llama.cpp
-OpenWhispr
-API
-GitHub
-Python
-Node.js
-Claude
-Ollama
-ZeroTier
+const VOCABULARY_DEFAULT = `# 詞彙提示：一行一個詞。常見的科技名詞（VRAM、repo、GitHub、Claude…）已經內建，這裡只需要放
+# 「你自己常講、而模型老是寫錯」的詞：產品型號、人名、公司名、你那一行的術語。
+# 不要放模型本來就會寫對的短詞（GPU、AI、API）——列出來的詞會把發音相近的字吸過去。
+# Vocabulary hint for Qwen3-ASR family models: one term per line; # starts a comment. Common tech terms
+# are built in; add only your own names and jargon that the model keeps getting wrong.
 `;
 let vocabulary = []; // terms
 let vocabularyMtime = 0;
@@ -894,11 +970,30 @@ function loadVocabulary() {
     log(`vocabulary hint loaded (${vocabulary.length} terms)`);
   } catch (err) { vocabulary = []; log(`vocabulary hint unavailable: ${err.message}`); }
 }
+// General tech terms that go out after the user's own words (builtinVocabulary: false turns them off),
+// so nobody has to type "VRAM" or "repo" into a file. Measured on 203 real dictation clips: English
+// terms found 83 % -> 88 % ("repo" 3/12 -> 12/12, "VRAM" 0/4 -> 4/4). What the measurements also say:
+//  - only terms the model gets wrong on its own belong here. A listed term pulls similar-sounding
+//    words towards it: with "AI" listed a lecturer's "RL" became "AI", with "PCIe" listed "PCH"
+//    became "PCIe" - so no GPU/CPU/AI/API/PR/PCIe, which the model writes correctly anyway;
+//  - more is not better: 100 and 300 terms found nothing more and 300 made short clips come back empty;
+//  - it is no cure-all: "session" is listed and still comes out as "season" every time, and on lecture
+//    audio about other subjects the list costs a little accuracy (4.4 % -> 4.9 % error).
+const BUILTIN_VOCABULARY = ["VRAM", "NVIDIA", "RTX", "DLSS", "CUDA", "Vulkan", "NAS", "Wi-Fi", "LLM", "agent", "repo", "commit",
+  "merge", "branch", "main", "README", "session", "GitHub", "Docker", "Python", "Claude", "GPT", "Codex", "Opus", "Gemini", "Ollama",
+  "llama.cpp", "Whisper", "OpenWhispr", "ZeroTier", "Windows", "Linux", "macOS", "Chrome", "VS Code"];
+const VOCABULARY_LIMIT = 100;
+function vocabularyTerms() {
+  loadVocabulary();
+  const seen = new Set();
+  const all = cfg.builtinVocabulary === false ? vocabulary : vocabulary.concat(BUILTIN_VOCABULARY);
+  return all.filter((t) => !seen.has(t.toLowerCase()) && seen.add(t.toLowerCase())).slice(0, VOCABULARY_LIMIT);
+}
 const LLAMA_INSTRUCTION_DEFAULT = "以下是台灣人講的中文，夾雜英文術語時請保留英文原文；數字與型號請用阿拉伯數字。";
 function systemPrompt() {
-  loadVocabulary();
+  const terms = vocabularyTerms();
   const inst = typeof cfg.llamaInstruction === "string" ? cfg.llamaInstruction.trim() : LLAMA_INSTRUCTION_DEFAULT;
-  const words = vocabulary.length ? `常見詞彙：${vocabulary.join(", ")}` : "";
+  const words = terms.length ? `常見詞彙：${terms.join(", ")}` : "";
   return [inst, words].filter(Boolean).join("\n") || null;
 }
 
@@ -1010,15 +1105,20 @@ async function transcribeWhisper(body, contentType) {
 
 // llama-server (Qwen3-ASR family): wav in, model chatter and Simplified script out.
 // Two ways to ask the model: the chat endpoint (takes the vocabulary hint; preferred) and the plain
-// transcription endpoint (no hint). Fine-tunes such as TEA-ASR answer the chat endpoint with nothing
-// but the language tag, so an empty chat reply switches this backend session to the plain endpoint.
+// transcription endpoint (no hint). Fine-tunes such as TEA-ASR stop right after the language tag on
+// the chat endpoint; handing that tag back as the start of the answer ("prefill") makes them go on.
+// Measured on 126 lecture clips: TEA-ASR-1.1 through the transcription endpoint left 51 empty and
+// echoed the endpoint's own instruction in others (45 % error); with the prefill, 0 empty and 2.8 %.
+// For Qwen3-ASR itself the prefill changes nothing. The plain endpoint stays as the last resort.
+let chatNeedsPrefill = false; // set on the first tag-only reply, cleared when a backend loads
 let chatUnreliable = false;
 
-async function llamaChat(wav) {
+async function llamaChat(wav, prefill) {
   const messages = [];
   const system = systemPrompt();
   if (system) messages.push({ role: "system", content: system });
   messages.push({ role: "user", content: [{ type: "input_audio", input_audio: { data: wav.toString("base64"), format: "wav" } }] });
+  if (prefill) messages.push({ role: "assistant", content: prefill }); // llama-server continues an open assistant turn
   const body = Buffer.from(JSON.stringify({ messages, temperature: 0, max_tokens: cfg.llamaMaxTokens || 2048 }), "utf8");
   const reply = await postBackend(body, "application/json", "/v1/chat/completions");
   if (reply.statusCode !== 200) throw new Error(`chat endpoint HTTP ${reply.statusCode}`);
@@ -1045,23 +1145,34 @@ async function transcribeLlama(body, contentType) {
   const wav = /wav/i.test(parsed.file.type) || /\.wav$/i.test(parsed.file.name) ? parsed.file.data : await toWav(parsed.file.data);
   const language = languageName(parsed.fields.language || cfg.language);
   const substantial = wav.length > 32000; // more than about a second of audio should never transcribe to nothing
+  const empty = (t) => substantial && !stripAsrTag(t).trim();
   let text = null;
   let via = "chat";
   if (cfg.llamaMode !== "transcriptions" && !chatUnreliable) {
-    try { text = await llamaChat(wav); } catch (err) { log(`chat endpoint failed (${err.message}); using the transcription endpoint`); }
-    if (text !== null && substantial && !stripAsrTag(text).trim()) {
-      chatUnreliable = true;
-      log("chat endpoint returned no transcript for this model; using the transcription endpoint until the next load");
-      text = null;
+    const prefill = `language ${language || "Chinese"}<asr_text>`;
+    try {
+      text = await llamaChat(wav, chatNeedsPrefill ? prefill : null);
+      if (empty(text) && !chatNeedsPrefill) {
+        text = await llamaChat(wav, prefill);
+        // Only a reply that the prefill rescued says something about the model; silence stays empty either way.
+        if (!empty(text)) { chatNeedsPrefill = true; log("this model stops after the language tag on the chat endpoint; prefilling its answers until the next load"); }
+      }
+    } catch (err) { log(`chat endpoint failed (${err.message}); using the transcription endpoint`); text = null; }
+  }
+  if (text === null || empty(text)) {
+    const viaChat = text;
+    text = await llamaTranscriptions(wav, language);
+    if (empty(text)) text = await llamaTranscriptions(wav, language); // a fresh process sometimes answers its first request with nothing
+    if (empty(text)) { if (viaChat !== null) text = viaChat; } // nothing either way: there was no speech
+    else {
+      via = "transcriptions";
+      if (viaChat !== null && !chatUnreliable && cfg.llamaMode !== "transcriptions") {
+        chatUnreliable = true;
+        log("chat endpoint returned no transcript but the transcription endpoint did; using the latter until the next load");
+      }
     }
   }
-  if (text === null) {
-    via = "transcriptions";
-    text = await llamaTranscriptions(wav, language);
-    // TEA-ASR occasionally answers a fresh process's first request with nothing but the language tag.
-    if (substantial && !stripAsrTag(text).trim()) { log("empty transcript; retrying once"); text = await llamaTranscriptions(wav, language); }
-  }
-  const out = tidy(applyLexicon(toTraditional(stripAsrTag(text))));
+  const out = tidy(tidyLatin(applyLexicon(toTraditional(stripAsrTag(text)))));
   return { statusCode: 200, type: "application/json; charset=utf-8", raw: Buffer.from(JSON.stringify({ text: out }), "utf8"), via };
 }
 

@@ -12,7 +12,7 @@ $public = @(
   "README.md", "LICENSE", ".gitignore", "build.ps1", ".github\workflows\release.yml",
   "whisper-gateway.js", "gateway.config.default.json",
   "src\GatewayTray.cs",
-  "docs\openwhispr-notes.md",
+  "docs\openwhispr-notes.md", "docs\asr-model-comparison.md",
   "models\README.md",
   "tools\export-clean.ps1", "tools\test-model.ps1", "tools\test-host-endpoint.ps1",
   "tools\make-test-clip2.ps1", "tools\make-test-clip3.ps1", "tools\asr-matrix.py", "tools\idle-release.ps1",

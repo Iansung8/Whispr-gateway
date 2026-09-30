@@ -1,6 +1,6 @@
 # WhisprGateway
 
-**OpenWhispr 用的隨需載入語音辨識閘道** — 讓 [OpenWhispr](https://github.com/OpenWhispr/openwhispr) 用你自選的本機模型做聽寫：**Qwen3-ASR 系列**（推薦台灣版 TEA-ASR-1.1，原生繁體、自帶標點）或 whisper.cpp 模型（Breeze-ASR-25…）。模型**平時不佔 GPU**，可從系統匣切換模型／GPU／CPU，也能給區域網路或 VPN 上的其他電腦用。
+**OpenWhispr 用的隨需載入語音辨識閘道** — 讓 [OpenWhispr](https://github.com/OpenWhispr/openwhispr) 用你自選的本機模型做聽寫：**Qwen3-ASR 系列**（實測最準的是 Qwen3-ASR-1.7B，見 [docs/asr-model-comparison.md](docs/asr-model-comparison.md)）或 whisper.cpp 模型（Breeze-ASR-25…）。模型**平時不佔 GPU**，可從系統匣切換模型／GPU／CPU，也能給區域網路或 VPN 上的其他電腦用。
 
 > *English summary:* a tiny Windows tray app + Node gateway that exposes an OpenAI-compatible `/v1/audio/transcriptions` endpoint for OpenWhispr's **self-hosted** mode. It runs either llama.cpp's `llama-server` (Qwen3-ASR family GGUF + mmproj) or whisper.cpp's `whisper-server` (ggml), spawns the server only when a request arrives and unloads it after N idle minutes (0 VRAM when idle), lets you pick the model and GPU / CPU from the tray, converts Simplified output to Taiwan Traditional without rewriting vocabulary, adds punctuation for whisper models from segment boundaries, and can serve other PCs on your LAN/VPN. Nothing large is bundled. UI and docs are in Traditional Chinese.
 
@@ -24,9 +24,12 @@ WhisprGateway.exe = 系統匣圖示（語）：看管閘道 + 手動控制
 
 | 模型 | 引擎 | 大小 | 特點 |
 |---|---|---|---|
-| **Qwen3-ASR-1.7B**（預設推薦）／0.6B | llama.cpp | 2.17 GB／0.80 GB ＋ mmproj 0.36／0.21 GB | 阿里官方（2026-01，Apache-2.0），30 語言＋22 種漢語方言口音，不需台灣微調就能處理台灣口音與中英夾雜，自帶標點；輸出簡體，閘道自動轉台灣繁體字形（只轉字、不換詞）。0.6B 小很多、更快，合成語音測試與 1.7B 結果相同，真人語音略遜 |
-| TEA-ASR-1.1 | llama.cpp | Q6_K 1.42 GB ＋ mmproj 0.36 GB | Qwen3-ASR-1.7B 的台灣微調（MIT）：原生繁體＋台灣用字。作者公布 CommonVoice zh-TW 錯誤率 3.58%（Qwen3-ASR 3.90%、Breeze 8.03%）。在 llama.cpp 下的小怪癖：新行程的第一句偶爾回空白（閘道會自動重試一次）、時間會寫成「3:00」、逗號較少 |
-| Breeze-ASR-25 | whisper.cpp | q8_0 1.66 GB | MediaTek 台灣華語微調；不太輸出標點，由閘道依停頓補上；只需要 OpenWhispr 的引擎 |
+| **Qwen3-ASR-1.7B**（推薦）| llama.cpp | Q8 2.17 GB 或 Q4_K_M 1.28 GB ＋ mmproj 0.36 GB | 阿里官方（2026-01，Apache-2.0），30 語言＋22 種漢語方言口音，不需台灣微調就能處理台灣口音與中英夾雜，自帶標點；輸出簡體，閘道自動轉台灣繁體字形（只轉字、不換詞）。Q4_K_M 的準確度幾乎一樣，適合放在 CPU 上當備援 |
+| Qwen3-ASR-0.6B | llama.cpp | 0.80 GB ＋ mmproj 0.21 GB | 同系列的小模型：CPU 上最快，但真人語音的錯字約是 1.7B 的兩倍 |
+| TEA-ASR-1.1 | llama.cpp | Q6_K 1.42 GB ＋ mmproj 0.36 GB | Qwen3-ASR-1.7B 的台灣微調（MIT）：原生繁體＋台灣用字。課堂錄音上明顯比原版準，個人聽寫上與原版相當。時間會寫成「3:00」、逗號較少 |
+| Breeze-ASR-25 | whisper.cpp | q8_0 1.66 GB | MediaTek 台灣華語微調；不太輸出標點，由閘道依停頓補上；只需要 OpenWhispr 的引擎。會自動略去「呃、啊」這類語助詞 |
+
+**怎麼選**：我們拿 203 段真實的台灣腔聽寫錄音（中英夾雜）比了 17 個系統，逐段對過答案，另外做了不看模型名稱的盲測。結論是 Qwen3-ASR-1.7B 最準（錯字率 1.8%，Breeze-ASR-25 4.4%、Whisper large-v3 4.8%），英文術語則是每個模型都只抓到八成左右、錯的詞各不相同。完整數字、方法與沒入選的模型見 [docs/asr-model-comparison.md](docs/asr-model-comparison.md)。
 
 下載指令與 sha256 見 [models/README.md](models/README.md)。**更換模型＝把檔案放進 `models\`，再從系統匣「模型」選它。**
 
@@ -117,7 +120,15 @@ Breeze-ASR-25 本身幾乎不輸出標點（試過多種 prompt，最多換來�
 
 - 判斷依據是「**有沒有別的程式，自己一個就佔了一大塊 VRAM**」：每 10 秒用 Windows 內建的 `typeperf` 讀「GPU Process Memory」計數器（約 1 秒、幾乎不耗 CPU）。任何單一程式 ≥ 2 GB（`vramGuardProcessMiB`）且連續兩次都在 → 卸載模型、讓出 GPU，系統匣會顯示是誰（例如「Endfield 佔用 7.9 GB」）。遊戲通常 4–8 GB；桌面上的程式各自都不到 1 GB。`dwm`（桌面合成，計數器本身也不準）和 NVIDIA 的 Overlay 預設忽略——Overlay 掛進遊戲時自己會漲到 2.5 GB，實測《崩壞：星穹鐵道》本身只用 1.5 GB、還剩 9.6 GB，卻因為 Overlay 被當成大戶；其他不該算的程式用 `vramGuardIgnore`（正規表示式）追加。
 - 另一個觸發條件：剩餘 VRAM < 1 GB（`vramGuardMinFreeMiB`）持續 10 秒。
-- 讓出期間聽寫**改用 CPU**（不碰 VRAM），而且改用較小的模型（`vramGuardCpuModel`，預設 `Qwen3-ASR-0.6B-Q8_0.gguf`，檔案在才用）；設「不自動卸載」時，讓出 90 秒後（遊戲載入完）先把 CPU 模型預載好。實戰量到：遊戲載入中用 1.7B 跑 CPU，第一句要 39 秒。
+- 讓出期間聽寫**改用 CPU**（不碰 VRAM），而且改用比較小的檔案（`vramGuardCpuModel`）：預設先找 `Qwen3-ASR-1.7B.Q4_K_M.gguf`，沒有再找 `Qwen3-ASR-0.6B-Q8_0.gguf`，都沒有就用原本的模型。設「不自動卸載」時，讓出 90 秒後（遊戲載入完）先把 CPU 模型預載好。
+
+  | CPU 上的模型（i5-13600K、10 執行緒、機器閒置） | 錯字率 | 英文術語命中 | 17 秒的一句話 | RAM |
+  |---|---|---|---|---|
+  | Qwen3-ASR-1.7B Q8（GPU 上用的那個） | 1.8% | 83% | 4.2 秒 | 4.1 GB |
+  | **Qwen3-ASR-1.7B Q4_K_M** | 2.2% | 82% | 2.8 秒 | 4.0 GB |
+  | Qwen3-ASR-0.6B Q8 | 3.7% | 75% | 1.8 秒 | 2.8 GB |
+
+  遊戲執行中 CPU 被搶，秒數大約再加倍。想要最快就把 `vramGuardCpuModel` 設成 `Qwen3-ASR-0.6B-Q8_0.gguf`。
 - 那個大戶不在了、剩餘 VRAM 也夠放回模型，持續 60 秒（`vramGuardResumeSeconds`）→ 回到 GPU；若設「不自動卸載」會自動重新載入。
 
 實測《明日方舟：終末地》（RTX 5080）：遊戲行程最高吃到 7.9 GB、總用量 10.5 GB，閘道在遊戲期間完全沒搶 VRAM。
@@ -130,12 +141,27 @@ Breeze-ASR-25 本身幾乎不輸出標點（試過多種 prompt，最多換來�
 
 台灣人講「CUDA」，模型常聽成中文音節寫成「酷達」。Qwen3-ASR 訓練時就會參考「上下文詞彙」，所以閘道把 `data\vocabulary.txt` 裡的詞連同一句指示（`gateway.config.json` 的 `llamaInstruction`）當 system prompt 送給模型——實測「酷達」就變回「CUDA」，純中文的句子不受影響。系統匣「詞彙 → 編輯詞彙提示…」會用記事本打開這個檔，一行一個詞，存檔後下一句就生效。這等於補上 OpenWhispr 自訂字典在自架模式送不出來的功能。
 
-技術細節：llama-server 的轉錄端點沒有提示欄位，所以閘道改走 `/v1/chat/completions`（音訊＋system prompt）。微調版（如 TEA-ASR）對 chat 端點常回空白，閘道偵測到就自動改回轉錄端點。目前提示救不回的：多音節的音譯（「拉馬點西批批」→ llama.cpp）、型號數字（RTX 5080 有時寫成「五千零八十」）。
+技術細節：llama-server 的轉錄端點沒有提示欄位，所以閘道改走 `/v1/chat/completions`（音訊＋system prompt）。微調版（如 TEA-ASR）在 chat 端點只回語言標籤就停；閘道偵測到後，把那個標籤當成「回答的開頭」交還給模型，它就會接著寫完（126 段課堂錄音實測：走轉錄端點時 51 段空白、錯字率 45%；改用這個做法後 0 段空白、2.8%）。
 
-兩個實測出來的用法：
+**常見的科技名詞已經內建**（VRAM、NVIDIA、DLSS、repo、commit、GitHub、Claude…共 35 個，`builtinVocabulary: false` 可關），你的檔案只需要放「自己常講、而模型老是寫錯」的詞。用 203 段真實聽寫錄音量到的事：
 
-- **詞彙表要短、重要的放前面**。12 個詞加到 20 個時新詞都生效（A770、mATX、Overlay），加到 28 個時原本救得回來的「CUDA」又變回「酷達」——詞越多，每個詞分到的注意力越少。只留你真的會講的，二十個上下為宜。
-- **型號裡的數字交給替換表**。模型常把數字寫成國字，提示改不動它，就在 `data\taiwan-lexicon.txt` 加一行「模型寫法、Tab、改成」，例如 `DLSS 五`→`DLSS 5`、`RTX 五千零八十`→`RTX 5080`（替換後的文字可以含空白）。
+- **有用，但不是萬靈丹**。英文術語命中率 83% → 88%（`repo` 12 次裡從對 3 次變成全對、`VRAM` 從 0 變成全對）。但 `session` 列進去了還是每次都寫成 `season`。
+- **列出來的詞會把發音相近的字吸過去**。列了 `AI`，課堂錄音裡的「RL」就變成「AI」；列了 `PCIe`，「PCH」就變成「PCIe」。所以不要放模型本來就寫得對的短詞（GPU、CPU、AI、API、PR）。
+- **不是越多越好**。50 個詞之後命中率不再上升；300 個詞會讓幾段很短的錄音變成空白。總數上限 100。
+- 講別的主題時，詞彙表會讓整體錯字率略升（課堂錄音 4.4% → 4.9%）。
+
+## 縮寫與數字的整理（Qwen3-ASR 系列）
+
+模型輸出裡最礙眼的兩件事，由閘道在最後一步修掉，不靠詞彙表：
+
+- **被拆開的縮寫**：`G P U`→`GPU`、`N V I D I A`→`NVIDIA`、`p m t i`→`PMTI`。203 段錄音裡原本有 33 處。
+- **國字數字**：
+  - 緊跟英文的算型號或版本：`RTX 五零八零`→`RTX 5080`、`DLSS 五`→`DLSS 5`、`A 七七零`→`A770`、`Opus 五點五`→`Opus 5.5`、`PR 四十三`→`PR 43`
+  - 後面接英文單位：`十六 GB`→`16 GB`、`二十 kV`→`20 kV`、`二十七 B`→`27B`
+  - 其他地方只轉兩個字以上、確定是數字的：`三十秒`→`30秒`、`一百美金`→`100美金`、`七七零`→`770`、`九月十一號`→`9月11號`、`百分之二十`→`20%`、`十七槓四`→`17-4`
+  - 不動的：`一個`、`兩顆`、`一點`、`兩兩`、`萬一`、`千萬`、`十分`、`一二三`（數數）、`二三十個`、`十幾個`
+
+規則在 `whisper-gateway.js` 的 `tidyLatin`。替換表 `data\taiwan-lexicon.txt`（「模型寫法、Tab、改成」）仍可用來修個別的詞，例如 `season`→`session`。
 
 ## 自架模式的取捨
 
@@ -152,7 +178,8 @@ Breeze-ASR-25 本身幾乎不輸出標點（試過多種 prompt，最多換來�
 | `allowRemote`、`idleMinutes`、`device`、`modelFile`、`punctuation`、`convertSimplified`、`vramGuard` | 由系統匣選單寫入 |
 | `vramGuardProcessMiB`、`vramGuardMinFreeMiB`、`vramGuardResumeSeconds` | 讓出 GPU 的門檻：單一程式佔用多少 MiB 算大戶（預設 2000）、剩餘低於多少 MiB（預設 1024）、大戶離開後等幾秒才回到 GPU（預設 60） |
 | `vramGuardIgnore` | **額外**不算大戶的程式名稱（正規表示式，不含 .exe，例如 `^(chrome|obs64)$`）。內建名單 `dwm`、`csrss`、`NVIDIA Overlay`、`NVIDIA Share`、`NVIDIA app`、`nvcontainer` 一律忽略 |
-| `vramGuardCpuModel` | 讓出 GPU 期間在 CPU 上用的模型檔（預設 `Qwen3-ASR-0.6B-Q8_0.gguf`，不存在就用原本的模型；空字串＝一律用原本的） |
+| `vramGuardCpuModel` | 讓出 GPU 期間在 CPU 上用的模型檔（預設依序找 `Qwen3-ASR-1.7B.Q4_K_M.gguf`、`Qwen3-ASR-0.6B-Q8_0.gguf`，都不存在就用原本的模型；空字串＝一律用原本的） |
+| `builtinVocabulary` | `false`＝不送內建的科技名詞，只送 `data\vocabulary.txt` 裡的（預設 `true`） |
 | `language` | 辨識語言：whisper 用代碼（`zh`），Qwen3-ASR 自動換成名稱（`Chinese`）；`auto` 為自動偵測 |
 | `prompt` | 只給 whisper 模型的提示詞 |
 | `llamaInstruction` | 給 Qwen3-ASR 系列的指示句（system prompt 第一行）；預設「以下是台灣人講的中文，夾雜英文術語時請保留英文原文；數字與型號請用阿拉伯數字。」 |
