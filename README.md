@@ -38,7 +38,7 @@ WhisprGateway.exe = 系統匣圖示（語）：看管閘道 + 手動控制
 | 相依 | 需求 | 尋找順序 | 怎麼取得 |
 |---|---|---|---|
 | **Node.js** | 18.2 以上 | `runtime\node.exe` → PATH | <https://nodejs.org> |
-| **llama.cpp**（GGUF 模型用） | `llama-server`，b11178 以上 | `engine\llama-cuda\` → `engine\llama-vulkan\` → OpenWhispr 的 `%APPDATA%\open-whispr\bin\llama-vulkan\` → `engine\llama-cpu\` → OpenWhispr 內附的 CPU 版 | 從 <https://github.com/ggml-org/llama.cpp/releases> 下載 `llama-bNNNN-bin-win-vulkan-x64.zip` 解壓到 `engine\llama-vulkan\`（任何廠牌 GPU；NVIDIA 卡用它與 CUDA 版一樣快）。只裝了 OpenWhispr 也能跑（用它內附的 CPU 版），只是慢 |
+| **llama.cpp**（GGUF 模型用） | `llama-server`，b11178 以上 | `engine\llama-vulkan\` → OpenWhispr 的 `%APPDATA%\open-whispr\bin\llama-vulkan\` → `engine\llama-cpu\` → OpenWhispr 內附的 CPU 版 | 從 <https://github.com/ggml-org/llama.cpp/releases> 下載 `llama-bNNNN-bin-win-vulkan-x64.zip` 解壓到 `engine\llama-vulkan\`（Vulkan 版適用任何廠牌的 GPU）。只裝了 OpenWhispr 也能跑（用它內附的 CPU 版），只是慢。要用 CUDA：把 `-cuda-12.4-x64.zip` 與 `cudart-llama-bin-win-cuda-12.4-x64.zip` 解壓到 `engine\llama-cuda\`，存在時優先使用 |
 | **whisper.cpp**（ggml 模型用） | `whisper-server` | `engine\whisper-cuda\` → `%APPDATA%\open-whispr\bin\whisper-cuda\`（Vulkan、CPU 類推） | OpenWhispr → 設定 → 語音轉文字 → 本機 →「啟用 GPU」，閘道直接借用；或從 <https://github.com/OpenWhispr/whisper.cpp/releases> 自取 |
 | **ffmpeg** | 4.0 以上、含 opus 解碼 | `engine\ffmpeg\ffmpeg.exe` → PATH → OpenWhispr 內附的 ffmpeg-static | 裝了 OpenWhispr 就有；或 `winget install Gyan.FFmpeg` |
 | **模型** | 見上表 | `models\` | [models/README.md](models/README.md) |
