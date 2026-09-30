@@ -15,7 +15,8 @@ $public = @(
   "docs\openwhispr-notes.md",
   "models\README.md",
   "tools\export-clean.ps1", "tools\test-model.ps1", "tools\test-host-endpoint.ps1",
-  "tools\make-test-clip2.ps1", "tools\make-test-clip3.ps1", "tools\asr-matrix.py", "tools\idle-release.ps1"
+  "tools\make-test-clip2.ps1", "tools\make-test-clip3.ps1", "tools\asr-matrix.py", "tools\idle-release.ps1",
+  "tools\watch-guard.sh", "tools\top-vram.ps1"
 )
 
 New-Item -ItemType Directory -Force $Target | Out-Null

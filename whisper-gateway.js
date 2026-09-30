@@ -215,30 +215,35 @@ function refreshGpus() {
 }
 
 // ---- VRAM guard ("讓出 GPU") ----
-// Optional (vramGuard). Samples the GPU's memory with nvidia-smi every 5 s. When other programs' usage
-// jumps (a game starting) or free VRAM runs low, the model is unloaded and dictation falls back to the
-// CPU until the other usage has gone back down for a while; then the GPU is used again (and the model
-// preloaded if automatic unload is off). "Other programs' usage" = used VRAM minus what our own
-// backend takes; its reference is the lowest value seen over the last 10 minutes, so slow creep from
-// browsers or chat apps is absorbed while a game's multi-GB jump is not. No game list, no process
-// scanning - VRAM is what actually matters.
+// Optional (vramGuard). While some OTHER single program holds a big block of VRAM (a game, LM Studio,
+// Stable Diffusion ...) the model is unloaded and dictation runs on the CPU; once no such program is
+// left for a while the GPU is used again (and the model preloaded if automatic unload is off).
+//
+// The signal is per-process dedicated GPU memory from Windows' "GPU Process Memory" counters (read with
+// typeperf, ~1 s, negligible CPU): a game shows up as one process with 4-8 GB, while everyday desktop
+// programs stay under 1 GB each. An earlier version looked at the rise of TOTAL usage instead and got
+// both directions wrong in real use: the desktop waking up (+1.9 GB across dwm/browser/player) tripped
+// it with 11 GB still free, and overlays a game leaves behind kept it from coming back. No game list is
+// needed either way. Running truly low on free VRAM is kept as a second trigger.
 if (typeof cfg.vramGuard !== "boolean") cfg.vramGuard = false;
 const GUARD = {
-  riseMiB: Number(cfg.vramGuardRiseMiB) || 1500,
+  processMiB: Number(cfg.vramGuardProcessMiB) || 2000,
+  ignore: new RegExp(cfg.vramGuardIgnore || "^(dwm|csrss|system|idle)$", "i"), // dwm's counter is inflated and it is the desktop itself
   minFreeMiB: Number(cfg.vramGuardMinFreeMiB) || 1024,
-  resumeMarginMiB: 800,
   triggerMs: 10000,
   resumeMs: (Number(cfg.vramGuardResumeSeconds) || 60) * 1000,
-  windowMs: 10 * 60000,
 };
 let lastVram = null; // { usedMiB, totalMiB, at }
 let ourMiB = 0; // VRAM our GPU backend took (measured); 0 = unknown, then estimated from the model files
 let usedBeforeLoad = null;
-let otherSamples = []; // [{ at, other }] while not backed off
-let frozenBaseline = null; // reference kept while backed off
-let peakOther = null; // highest other-programs usage seen while backed off
 let vramBackedOff = false;
-let pressureSince = null;
+let backoffReason = null; // shown in the tray
+let backoffByScarcity = false;
+let hog = null; // { pid, name, mib } largest foreign process above the threshold, from the last sample
+let hogHits = 0;
+let perProcessOk = true;
+let guardTicks = 0;
+let lowFreeSince = null;
 let calmSince = null;
 
 const guardGpuIndex = () => (/^gpu:\d+$/.test(cfg.device) ? Number(cfg.device.split(":")[1]) : (gpus[0] ? gpus[0].index : 0));
@@ -281,12 +286,67 @@ function cpuFallbackModel() {
   return m && m.engine === currentModel().engine && (m.engine !== "llama" || m.mmproj) ? m : null;
 }
 
+// pid -> dedicated GPU memory in MiB, or null when the counters cannot be read.
+function queryProcessVram() {
+  return new Promise((resolve) => {
+    execFile("typeperf", ["\\GPU Process Memory(*)\\Dedicated Usage", "-sc", "1"],
+      { timeout: 8000, windowsHide: true, maxBuffer: 8 * 1024 * 1024 }, (err, stdout) => {
+        if (err) return resolve(null);
+        const lines = String(stdout).split(/\r?\n/).filter((l) => l.startsWith('"'));
+        if (lines.length < 2) return resolve(null);
+        const cells = (l) => l.replace(/^"|"$/g, "").split('","');
+        const head = cells(lines[0]);
+        const vals = cells(lines[1]);
+        const per = new Map();
+        for (let i = 1; i < head.length; i++) {
+          const m = /pid_(\d+)_/.exec(head[i]);
+          const mib = Number(vals[i]) / 1048576;
+          if (m && Number.isFinite(mib)) per.set(Number(m[1]), Math.max(per.get(Number(m[1])) || 0, mib));
+        }
+        resolve(per);
+      });
+  });
+}
+
+let processNames = { at: 0, map: new Map() }; // pid -> image name without .exe
+function refreshProcessNames(neededPids) {
+  return new Promise((resolve) => {
+    if (Date.now() - processNames.at < 60000 && neededPids.every((p) => processNames.map.has(p))) return resolve(processNames.map);
+    execFile("tasklist", ["/FO", "CSV", "/NH"], { timeout: 8000, windowsHide: true, maxBuffer: 8 * 1024 * 1024 }, (err, stdout) => {
+      if (err) return resolve(processNames.map);
+      const map = new Map();
+      for (const line of String(stdout).split(/\r?\n/)) {
+        const m = /^"([^"]+)","(\d+)"/.exec(line);
+        if (m) map.set(Number(m[2]), m[1].replace(/\.exe$/i, ""));
+      }
+      processNames = { at: Date.now(), map };
+      resolve(map);
+    });
+  });
+}
+
+async function sampleHog() {
+  const per = await queryProcessVram();
+  perProcessOk = !!per;
+  if (!per) { hog = null; hogHits = 0; return; }
+  const big = [...per.entries()].filter(([pid, mib]) => mib >= GUARD.processMiB && !(child && pid === child.pid));
+  const names = big.length ? await refreshProcessNames(big.map(([pid]) => pid)) : processNames.map;
+  let best = null;
+  for (const [pid, mib] of big) {
+    const name = names.get(pid) || `pid ${pid}`;
+    if (GUARD.ignore.test(name)) continue;
+    if (!best || mib > best.mib) best = { pid, name, mib: Math.round(mib) };
+  }
+  hog = best;
+  hogHits = best ? hogHits + 1 : 0;
+}
+
 function clearBackoff(reason) {
   vramBackedOff = false;
-  frozenBaseline = null;
-  peakOther = null;
+  backoffReason = null;
+  backoffByScarcity = false;
   calmSince = null;
-  otherSamples = [];
+  lowFreeSince = null;
   log(`VRAM guard: GPU available again (${reason})`);
   if (child && activeDevice === "cpu") stopBackend("back to the GPU");
   if (!(cfg.idleMinutes > 0)) {
@@ -299,27 +359,23 @@ function clearBackoff(reason) {
 async function guardTick() {
   if (!cfg.vramGuard) { if (vramBackedOff) clearBackoff("guard switched off"); return; }
   const v = await queryVram();
-  if (!v) return;
-  lastVram = v;
+  if (v) lastVram = v;
+  if (guardTicks++ % 2 === 0) await sampleHog(); // per-process data every 10 s
   if (starting) return; // a load in progress distorts the numbers
   const now = Date.now();
-  const ours = gpuBackendRunning() ? ourEstimate() : 0;
-  const other = v.usedMiB - ours;
-  const free = v.totalMiB - v.usedMiB;
+  const free = v ? v.totalMiB - v.usedMiB : null;
   if (!vramBackedOff) {
-    otherSamples.push({ at: now, other });
-    otherSamples = otherSamples.filter((s) => now - s.at <= GUARD.windowMs);
-    const baseline = Math.min(...otherSamples.map((s) => s.other));
-    const rise = other - baseline;
-    if (!(rise >= GUARD.riseMiB || (ours > 0 && free < GUARD.minFreeMiB))) { pressureSince = null; return; }
-    pressureSince = pressureSince || now;
-    if (now - pressureSince < GUARD.triggerMs || inFlight > 0) return;
+    const scarce = gpuBackendRunning() && free !== null && free < GUARD.minFreeMiB;
+    lowFreeSince = scarce ? lowFreeSince || now : null;
+    const byHog = !!hog && hogHits >= 2; // seen in two samples, i.e. for 10-20 s
+    const byScarcity = !!lowFreeSince && now - lowFreeSince >= GUARD.triggerMs;
+    if (!(byHog || byScarcity) || inFlight > 0) return;
     vramBackedOff = true;
-    frozenBaseline = baseline;
-    peakOther = other;
-    pressureSince = null;
+    backoffByScarcity = !byHog;
+    backoffReason = byHog ? `${hog.name} 佔用 ${(hog.mib / 1024).toFixed(1)} GB` : `VRAM 只剩 ${free} MiB`;
+    lowFreeSince = null;
     calmSince = null;
-    log(`VRAM guard: other programs ${baseline} -> ${other} MiB (+${rise}), free ${free} MiB - releasing the GPU; dictation uses the CPU meanwhile`);
+    log(`VRAM guard: ${byHog ? `${hog.name} (pid ${hog.pid}) holds ${hog.mib} MiB of VRAM` : `only ${free} MiB of VRAM free`} - releasing the GPU; dictation uses the CPU meanwhile`);
     clearTimeout(idleTimer);
     idleDeadline = null;
     if (child) stopBackend("VRAM guard");
@@ -333,16 +389,14 @@ async function guardTick() {
       }, 90000);
     }
   } else {
-    peakOther = Math.max(peakOther, other);
-    // Back once the extra usage is (mostly) gone: within the margin of the old reference, OR at least 70%
-    // of the jump released. The second test matters: overlays a game starts (NVIDIA Overlay, a bigger
-    // dwm) often stay resident after it exits, and small spikes from other windows must not keep
-    // restarting the 60-second wait (seen live: +581 of an 800 MiB margin delayed the return by 1m40s).
-    const released = other <= frozenBaseline + GUARD.resumeMarginMiB || other <= peakOther - 0.7 * (peakOther - frozenBaseline);
-    const calm = released && free >= ourEstimate() + GUARD.minFreeMiB;
+    if (hog) backoffReason = `${hog.name} 佔用 ${(hog.mib / 1024).toFixed(1)} GB`;
+    // Back when no big VRAM user is left and the model fits again. After a scarcity-only back-off an
+    // extra 1 GB of headroom is required, otherwise unloading itself would make room and it would flap.
+    const room = ourEstimate() + GUARD.minFreeMiB + (backoffByScarcity ? 1024 : 0);
+    const calm = !hog && (free === null || free >= room);
     if (!calm) { calmSince = null; return; }
     calmSince = calmSince || now;
-    if (now - calmSince >= GUARD.resumeMs && inFlight === 0) clearBackoff(`other programs back to +${other - frozenBaseline} MiB`);
+    if (now - calmSince >= GUARD.resumeMs && inFlight === 0) clearBackoff(`no large VRAM user left, ${free} MiB free`);
   }
 }
 
@@ -385,7 +439,7 @@ function problems() {
       : "偵測不到 NVIDIA GPU，暫時改用 CPU");
   }
   if (!findFfmpeg()) out.push("找不到 ffmpeg：請安裝 ffmpeg 並加入 PATH（或安裝 OpenWhispr）");
-  if (cfg.vramGuard && gpus.length === 0) out.push("「VRAM 不足時讓出 GPU」需要 NVIDIA 驅動（nvidia-smi），目前無作用");
+  if (cfg.vramGuard && !perProcessOk) out.push("讀不到各程式的 VRAM 用量（typeperf），「讓出 GPU」只會在 VRAM 快滿時動作");
   if (model.engine === "llama" && cfg.convertSimplified && scriptDictState === "missing") out.push("簡繁字典下載失敗（data\\opencc\\），簡體輸出暫不轉換");
   return out;
 }
@@ -538,8 +592,8 @@ function status() {
     vramGuard: cfg.vramGuard,
     backedOff: vramBackedOff,
     activeModel: activeModelId,
-    guardBaseline: frozenBaseline,
-    guardPeak: peakOther,
+    guardReason: backoffReason,
+    guardHog: hog ? { name: hog.name, mib: hog.mib } : null,
     vram: lastVram,
     ourVramMiB: gpuBackendRunning() ? ourEstimate() : 0,
     vocabularyTerms: vocabulary.length,
@@ -593,7 +647,7 @@ function handleControl(req, res, url) {
   if (url === "/control/vram-guard") {
     persist({ vramGuard: param("enabled") === "true" });
     log(`VRAM guard ${cfg.vramGuard ? "on" : "off"}`);
-    otherSamples = [];
+    hogHits = 0;
     if (!cfg.vramGuard && vramBackedOff) clearBackoff("guard switched off");
     return send(200, status());
   }

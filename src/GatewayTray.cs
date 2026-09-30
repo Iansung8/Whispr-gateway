@@ -477,7 +477,11 @@ namespace WhisprGateway
                          : backend == "loading" ? "模型載入中…"
                          : "模型未載入（不佔資源）";
             bool backedOff = lastStatus.ContainsKey("backedOff") && Convert.ToBoolean(lastStatus["backedOff"]);
-            if (backedOff) label = "已讓出 GPU（其他程式在用 VRAM）" + (backend == "loaded" ? "・CPU 模型已載入" : "・需要時用 CPU");
+            if (backedOff)
+            {
+                string why = lastStatus.ContainsKey("guardReason") && lastStatus["guardReason"] != null ? Convert.ToString(lastStatus["guardReason"]) : "其他程式在用 VRAM";
+                label = "已讓出 GPU（" + why + "）" + (backend == "loaded" ? "・CPU 模型已載入" : "・需要時用 CPU");
+            }
 
             notify.Icon = icons.ContainsKey(backend) ? icons[backend] : icons["unloaded"];
             SetTip("語音辨識閘道：" + label);
