@@ -439,10 +439,11 @@ function problems() {
   const model = currentModel();
   if (!cfg.modelFile || !fs.existsSync(modelPath())) out.push(`找不到模型：models\\${cfg.modelFile || "(未設定)"}（見 README「模型」）`);
   else if (model.engine === "llama" && !model.mmproj) out.push(`缺少 ${model.id} 的音訊編碼器（mmproj-*.gguf，與模型同一個 Hugging Face 頁面）`);
-  const gpuHint = model.engine === "llama" ? "把 llama.cpp 的 CUDA 版解壓到 engine\\llama-cuda\\" : "OpenWhispr →「啟用 GPU」";
+  const gpuHint = model.engine === "llama" ? "把 llama.cpp 的 Vulkan 版解壓到 engine\\llama-vulkan\\" : "OpenWhispr →「啟用 GPU」";
   if (!findEngine(model.engine, "cuda") && !findEngine(model.engine, "vulkan") && !findEngine(model.engine, "cpu")) {
     out.push(model.engine === "llama" ? "找不到 llama.cpp 引擎：請安裝 OpenWhispr，或見 README「相依項目」" : "找不到辨識引擎：請安裝 OpenWhispr 並在其設定按「啟用 GPU」");
-  } else if (cfg.device !== "cpu" && effectiveDevice() === "cpu") {
+  } else if (cfg.device !== "cpu" && !vramBackedOff && effectiveDevice() === "cpu") {
+    // Not while the GPU is released: that CPU use is deliberate and the tray title shows guardReason.
     out.push(cudaBroken ? "GPU 引擎啟動失敗，暫時改用 CPU"
       : !findEngine(model.engine, "cuda") ? `沒有 GPU 引擎（${gpuHint}），暫時改用 CPU`
       : "偵測不到 NVIDIA GPU，暫時改用 CPU");
