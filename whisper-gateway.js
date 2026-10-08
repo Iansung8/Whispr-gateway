@@ -42,6 +42,13 @@ if (typeof cfg.allowRemote !== "boolean") cfg.allowRemote = true;
 if (typeof cfg.convertSimplified !== "boolean") cfg.convertSimplified = true;
 if (!cfg.device) cfg.device = "gpu:0";
 
+// Texts the tray shows (problems, why the GPU was released) come in Traditional Chinese or English. The
+// tray passes the language it resolved (?lang=); uiLanguage "auto" otherwise follows this machine's locale.
+if (!cfg.uiLanguage) cfg.uiLanguage = "auto";
+const systemLang = /^zh/i.test(Intl.DateTimeFormat().resolvedOptions().locale) ? "zh-TW" : "en";
+const resolveLang = (v) => (v === "en" || v === "zh-TW" ? v : systemLang);
+const tr = (lang, zh, en) => (lang === "en" ? en : zh);
+
 function log(msg) {
   const line = `${new Date().toISOString()} ${msg}`;
   console.log(line);
@@ -195,9 +202,11 @@ function isAllowed(remote) {
 }
 
 // ---- compute devices ----
-let gpus = []; // [{ index, name, memoryMiB }] as reported by nvidia-smi (PCI bus order)
+let gpus = []; // [{ index, name, memoryMiB }] NVIDIA GPUs as reported by nvidia-smi (PCI bus order): the CUDA choices
 let nvidiaSmiPath = "nvidia-smi";
 let cudaBroken = false; // CUDA engine failed to start in this session -> stay off it until restart
+let vulkanDevices = []; // [{ index, name, memoryMiB }] the cards llama.cpp's Vulkan build lists (Vulkan0, Vulkan1 ...)
+let dxAdapters = new Map(); // LUID (hex) -> { name, vendorId, totalMiB }: every display adapter Windows knows, any vendor
 
 function refreshGpus() {
   const candidates = ["nvidia-smi", path.join(process.env.SystemRoot || "C:\\Windows", "System32", "nvidia-smi.exe")];
@@ -212,49 +221,143 @@ function refreshGpus() {
       });
   };
   tryNext(0);
+  refreshAdapters();
+}
+
+// Windows keeps one entry per display adapter under HKLM\SOFTWARE\Microsoft\DirectX with its name, LUID
+// and dedicated memory - the only vendor-neutral source for a card's VRAM size. The LUID ties it to the
+// GPU memory counters below. Entries from earlier boots stay behind with stale LUIDs; that is harmless,
+// since only LUIDs present in the live counters are ever looked up.
+function refreshAdapters() {
+  execFile("reg", ["query", "HKLM\\SOFTWARE\\Microsoft\\DirectX", "/s"],
+    { timeout: 8000, windowsHide: true, maxBuffer: 4 * 1024 * 1024 }, (err, stdout) => {
+      if (err) return;
+      const map = new Map();
+      for (const block of String(stdout).split(/\r?\n(?=HKEY_)/)) {
+        const val = (name) => { const m = new RegExp(`^\\s+${name}\\s+REG_\\w+\\s+(.*)$`, "m").exec(block); return m ? m[1].trim() : null; };
+        const luid = val("AdapterLuid");
+        const name = val("Description");
+        if (!luid || !name) continue;
+        try {
+          const mem = val("DedicatedVideoMemory");
+          map.set(BigInt(luid).toString(16), { name, vendorId: Number(val("VendorId") || 0), totalMiB: mem ? Number(BigInt(mem) / 1048576n) : 0 });
+        } catch {}
+      }
+      dxAdapters = map;
+    });
+}
+const adapterByName = (name) => [...dxAdapters.values()].find((a) => a.name.toLowerCase() === String(name).toLowerCase());
+// Integrated GPUs have (almost) no memory of their own; the model then lives in system RAM.
+const isIntegrated = (name) => { const a = adapterByName(name); return !!a && a.totalMiB < 1024; };
+
+// The Vulkan build numbers the cards itself (Vulkan0, Vulkan1 ..., integrated GPUs included) and --device
+// takes that number. The numbering is not stable: on a laptop with Intel + NVIDIA graphics the two
+// swapped places within minutes (it follows the cards' current state), so a card is chosen by NAME
+// ("vulkan:<name>") and its number is looked up again right before every start. With no --device and
+// two discrete cards, llama.cpp splits the model across both. Two cards with the same name cannot be
+// told apart; the first one listed is used.
+function listVulkanDevices() {
+  const exe = findEngine("llama", "vulkan");
+  if (!exe) return Promise.resolve([]);
+  return new Promise((resolve) => {
+    execFile(exe, ["--list-devices"], { cwd: path.dirname(exe), timeout: 30000, windowsHide: true }, (err, stdout, stderr) => {
+      const list = [];
+      for (const m of `${stdout}\n${stderr}`.matchAll(/^\s*Vulkan(\d+):\s*(.+?)\s*\((\d+) MiB/gm)) {
+        if (!list.some((d) => d.name === m[2])) list.push({ index: Number(m[1]), name: m[2], memoryMiB: Number(m[3]) });
+      }
+      resolve(err && !list.length ? null : list);
+    });
+  });
+}
+function refreshVulkanDevices() {
+  return listVulkanDevices().then((list) => { if (list) vulkanDevices = list; return vulkanDevices; });
+}
+const vulkanCardName = (device) => { const m = /^vulkan:(.+)$/.exec(device || ""); return m ? m[1] : null; };
+
+// The card the configured device names (null for "vulkan" = automatic, and for "cpu").
+function intendedGpuName() {
+  const card = vulkanCardName(cfg.device);
+  if (card) return card;
+  const m = /^gpu:(\d+)$/.exec(cfg.device || "");
+  const g = m && gpus.find((x) => x.index === Number(m[1]));
+  return g ? g.name : null;
 }
 
 // ---- VRAM guard ("讓出 GPU") ----
-// Optional (vramGuard). While some OTHER single program holds a big block of VRAM (a game, LM Studio,
-// Stable Diffusion ...) the model is unloaded and dictation runs on the CPU; once no such program is
-// left for a while the GPU is used again (and the model preloaded if automatic unload is off).
+// Optional (vramGuard). While some OTHER single program holds a big block of VRAM on the card the model
+// uses (a game, LM Studio, Stable Diffusion ...) the model is unloaded and dictation runs on the CPU; once
+// no such program is left for a while the GPU is used again (and the model preloaded if automatic
+// unload is off). Running low on free VRAM is a second trigger.
 //
-// The signal is per-process dedicated GPU memory from Windows' "GPU Process Memory" counters (read with
-// typeperf, ~1 s, negligible CPU): a game shows up as one process with several GB, while everyday
-// desktop programs stay under 1 GB each, so no game list is needed. Total usage is not used as the
-// signal because it also moves when the desktop wakes up. Running low on free VRAM is a second trigger.
+// The signal is Windows' per-program dedicated GPU memory, which works for any GPU vendor: a game shows
+// up as one process with several GB, while everyday desktop programs stay well below that, so no game
+// list is needed. Total usage alone is not used because it also moves when the desktop wakes up.
+// Thresholds are MiB (a number) or a share of the card ("15%"), set from the tray's VRAM window.
 if (typeof cfg.vramGuard !== "boolean") cfg.vramGuard = false;
-// Never a reason to back off: the desktop itself (dwm's counter is inflated) and NVIDIA's overlay, which
-// grows past the threshold by itself when it hooks a game. vramGuardIgnore adds to this list.
-const GUARD_IGNORE = "^(dwm|csrss|system|idle|nvidia overlay|nvidia share|nvidia app|nvcontainer)$";
-function guardIgnore() {
-  try { return new RegExp(cfg.vramGuardIgnore ? `${GUARD_IGNORE}|${cfg.vramGuardIgnore}` : GUARD_IGNORE, "i"); }
-  catch (err) { log(`vramGuardIgnore is not a valid regular expression (${err.message}) - ignored`); return new RegExp(GUARD_IGNORE, "i"); }
+if (!Array.isArray(cfg.vramGuardWhitelist)) cfg.vramGuardWhitelist = [];
+// Older versions kept the exceptions as a regex (vramGuardIgnore); a plain "^(A|B)$" becomes the list.
+{
+  const m = typeof cfg.vramGuardIgnore === "string" && /^\^\(?([^()|^$\\*+?[\]{}]+(?:\|[^()|^$\\*+?[\]{}]+)*)\)?\$$/.exec(cfg.vramGuardIgnore.trim());
+  if (m) {
+    const merged = [...cfg.vramGuardWhitelist];
+    for (const name of m[1].split("|")) if (!merged.some((n) => n.toLowerCase() === name.toLowerCase())) merged.push(name);
+    persist({ vramGuardWhitelist: merged, vramGuardIgnore: undefined });
+    log(`vramGuardIgnore moved to vramGuardWhitelist: ${merged.join(", ")}`);
+  }
 }
-const GUARD = {
-  processMiB: Number(cfg.vramGuardProcessMiB) || 2000,
-  ignore: guardIgnore(),
-  minFreeMiB: Number(cfg.vramGuardMinFreeMiB) || 1024,
-  triggerMs: 10000,
-  resumeMs: (Number(cfg.vramGuardResumeSeconds) || 60) * 1000,
-};
-let lastVram = null; // { usedMiB, totalMiB, at }
-let ourMiB = 0; // VRAM our GPU backend took (measured); 0 = unknown, then estimated from the model files
-let usedBeforeLoad = null;
+// Windows' own desktop processes never count: dwm's counter is inflated and grows with the monitors.
+const SYSTEM_PROCESSES = /^(dwm|csrss|system|idle)$/i;
+let ignoreCache = { source: null, re: null }; // vramGuardIgnore (advanced, regex) still works
+function ignoredByRegex(name) {
+  if (ignoreCache.source !== (cfg.vramGuardIgnore || null)) {
+    ignoreCache = { source: cfg.vramGuardIgnore || null, re: null };
+    if (cfg.vramGuardIgnore) {
+      try { ignoreCache.re = new RegExp(cfg.vramGuardIgnore, "i"); }
+      catch (err) { log(`vramGuardIgnore is not a valid regular expression (${err.message}) - ignored`); }
+    }
+  }
+  return !!ignoreCache.re && ignoreCache.re.test(name);
+}
+const isWhitelisted = (name) => cfg.vramGuardWhitelist.some((n) => String(n).toLowerCase() === String(name).toLowerCase()) || ignoredByRegex(name);
+
+function parseAmount(v) {
+  if (typeof v === "number") return Number.isFinite(v) && v >= 0 ? { unit: "MiB", value: v } : null;
+  const m = /^\s*(\d+(?:\.\d+)?)\s*(%?)\s*$/.exec(String(v === undefined || v === null ? "" : v));
+  return m ? { unit: m[2] ? "%" : "MiB", value: Number(m[1]) } : null;
+}
+const guardProcessAmount = () => parseAmount(cfg.vramGuardProcess !== undefined ? cfg.vramGuardProcess : cfg.vramGuardProcessMiB) || { unit: "MiB", value: 2048 };
+const guardMinFreeAmount = () => parseAmount(cfg.vramGuardMinFree !== undefined ? cfg.vramGuardMinFree : cfg.vramGuardMinFreeMiB) || { unit: "MiB", value: 1024 };
+const toMiB = (a, totalMiB) => (a.unit === "%" ? (totalMiB > 0 ? Math.round((totalMiB * a.value) / 100) : null) : a.value);
+const guardResumeMs = () => (Number(cfg.vramGuardResumeSeconds) || 60) * 1000;
+const GUARD_TRIGGER_MS = 10000;
+
+let lastVram = null; // { usedMiB, totalMiB, at } of the watched card
+let lastNvSmi = null; // the same from nvidia-smi, used when Windows' counters are unavailable
+let ourMiB = 0; // VRAM our GPU backend holds (measured); 0 = unknown, then estimated from the model files
+let ourLuid = null; // the card our GPU backend was last seen on
 let vramBackedOff = false;
-let backoffReason = null; // shown in the tray
+let backoffInfo = null; // { kind: "hog", name, mib } | { kind: "scarce", free } - shown in the tray
 let backoffByScarcity = false;
-let hog = null; // { pid, name, mib } largest foreign process above the threshold, from the last sample
+let hog = null; // { pid, name, mib } largest counted process above the threshold, from the last sample
 let hogHits = 0;
 let perProcessOk = true;
-let guardTicks = 0;
 let lowFreeSince = null;
 let calmSince = null;
+let panelSeenAt = 0; // the tray's VRAM window polls /control/vram; sample while it is open even with the guard off
+// Our recognition servers by pid: a sample taken just before one exited still lists it, and it must
+// not count as a foreign program then. Dropped once the counters no longer show it.
+const ownPids = new Set();
 
-const guardGpuIndex = () => (/^gpu:\d+$/.test(cfg.device) ? Number(cfg.device.split(":")[1]) : (gpus[0] ? gpus[0].index : 0));
 const gpuBackendRunning = () => !!(child && ready && activeDevice && activeDevice !== "cpu");
 
-function queryVram() {
+// nvidia-smi index of the watched card (fallback path only).
+function guardGpuIndex() {
+  if (/^gpu:\d+$/.test(cfg.device)) return Number(cfg.device.split(":")[1]);
+  const name = intendedGpuName();
+  const g = (name && gpus.find((x) => x.name === name)) || gpus[0];
+  return g ? g.index : 0;
+}
+function queryNvSmi() {
   return new Promise((resolve) => {
     execFile(nvidiaSmiPath, ["-i", String(guardGpuIndex()), "--query-gpu=memory.used,memory.total", "--format=csv,noheader,nounits"],
       { timeout: 5000, windowsHide: true }, (err, stdout) => {
@@ -263,6 +366,102 @@ function queryVram() {
         resolve(Number.isFinite(used) && Number.isFinite(total) ? { usedMiB: used, totalMiB: total, at: Date.now() } : null);
       });
   });
+}
+
+// One typeperf call (~1 s, negligible CPU) reads Windows' "GPU Adapter Memory" (per card) and "GPU Process
+// Memory" (per program and card) counters. Instance names carry the card's LUID, e.g.
+// "pid_1234_luid_0x00000000_0x0001A2B3_phys_0", so a game on one card never counts against another.
+// Only the instance part is parsed: counter names can be localized, instance names are not.
+let gpuSample = null; // { at, adapters: Map<luid, usedMiB>, procs: Map<luid, Map<pid, mib>> }
+let sampling = null;
+const luidKey = (hi, lo) => ((BigInt(hi) << 32n) | BigInt(lo)).toString(16);
+function sampleGpu() {
+  if (sampling) return sampling;
+  sampling = new Promise((resolve) => {
+    execFile("typeperf", ["\\GPU Adapter Memory(*)\\Dedicated Usage", "\\GPU Process Memory(*)\\Dedicated Usage", "-sc", "1"],
+      { timeout: 10000, windowsHide: true, maxBuffer: 16 * 1024 * 1024 }, (err, stdout) => {
+        const lines = String(stdout || "").split(/\r?\n/).filter((l) => l.startsWith('"'));
+        if (err || lines.length < 2) return resolve(null);
+        const cells = (l) => l.replace(/^"|"$/g, "").split('","');
+        const head = cells(lines[0]);
+        const vals = cells(lines[1]);
+        const adapters = new Map();
+        const procs = new Map();
+        for (let i = 1; i < head.length; i++) {
+          const mib = Number(vals[i]) / 1048576;
+          if (!Number.isFinite(mib)) continue;
+          const p = /\(pid_(\d+)_luid_(0x[0-9a-f]+)_(0x[0-9a-f]+)_phys_\d+\)/i.exec(head[i]);
+          if (p) {
+            const k = luidKey(p[2], p[3]);
+            if (!procs.has(k)) procs.set(k, new Map());
+            procs.get(k).set(Number(p[1]), (procs.get(k).get(Number(p[1])) || 0) + mib);
+            continue;
+          }
+          const a = /\(luid_(0x[0-9a-f]+)_(0x[0-9a-f]+)_phys_\d+\)/i.exec(head[i]);
+          if (a) adapters.set(luidKey(a[1], a[2]), (adapters.get(luidKey(a[1], a[2])) || 0) + mib);
+        }
+        resolve({ at: Date.now(), adapters, procs });
+      });
+  }).then(async (s) => {
+    perProcessOk = !!s;
+    gpuSample = s;
+    if (s) {
+      const pids = [];
+      for (const m of s.procs.values()) for (const [pid, mib] of m) if (mib >= 10) pids.push(pid);
+      await refreshProcessNames(pids);
+      absorbSample();
+    }
+    sampling = null;
+    return s;
+  });
+  return sampling;
+}
+
+// Where our backend sits and how much it holds, then the watched card's totals.
+function absorbSample() {
+  for (const pid of ownPids) {
+    if (!(child && child.pid === pid) && ![...gpuSample.procs.values()].some((m) => m.has(pid))) ownPids.delete(pid);
+  }
+  if (gpuBackendRunning()) {
+    let best = null;
+    for (const [luid, m] of gpuSample.procs) {
+      const mib = m.get(child.pid) || 0;
+      if (mib > 50 && (!best || mib > best.mib)) best = { luid, mib };
+    }
+    if (best) { ourLuid = best.luid; ourMiB = Math.max(ourMiB, Math.round(best.mib)); }
+  }
+  const card = watchedCard();
+  if (card.totalMiB && card.usedMiB !== null) lastVram = { usedMiB: card.usedMiB, totalMiB: card.totalMiB, at: gpuSample.at };
+}
+
+// The card to watch: the one our backend sits on, else the configured one, else the one with the most
+// VRAM (what llama.cpp / whisper.cpp pick on their own). null = unknown -> all cards together.
+function guardLuid() {
+  if (!gpuSample) return null;
+  if (ourLuid && gpuSample.adapters.has(ourLuid)) return ourLuid;
+  const live = [...gpuSample.adapters.keys()].filter((l) => dxAdapters.has(l));
+  const want = String(intendedGpuName() || "").toLowerCase();
+  const named = want && live.find((l) => dxAdapters.get(l).name.toLowerCase() === want);
+  if (named) return named;
+  return live.reduce((best, l) => (!best || dxAdapters.get(l).totalMiB > dxAdapters.get(best).totalMiB ? l : best), null);
+}
+
+const isIntegratedCard = (card) => card.totalMiB > 0 && card.totalMiB < 1024;
+
+// { name, totalMiB, usedMiB, procs: Map<pid, mib> | null } for the watched card.
+function watchedCard() {
+  const luid = guardLuid();
+  if (luid) {
+    const info = dxAdapters.get(luid);
+    return { name: info.name, totalMiB: info.totalMiB, usedMiB: Math.round(gpuSample.adapters.get(luid) || 0), procs: gpuSample.procs.get(luid) || new Map() };
+  }
+  let procs = null;
+  if (gpuSample) {
+    procs = new Map();
+    for (const m of gpuSample.procs.values()) for (const [pid, mib] of m) procs.set(pid, Math.max(procs.get(pid) || 0, mib));
+  }
+  const g = gpus.find((x) => x.index === guardGpuIndex());
+  return { name: g ? g.name : null, totalMiB: lastNvSmi ? lastNvSmi.totalMiB : null, usedMiB: lastNvSmi ? lastNvSmi.usedMiB : null, procs };
 }
 
 function ourEstimate() {
@@ -276,12 +475,6 @@ function ourEstimate() {
   return Math.round((bytes / 1048576) * 1.25) || 3000; // measured: Qwen3-ASR-1.7B files 2.4 GiB -> 3.2 GiB in VRAM
 }
 
-async function measureOurVram() {
-  if (usedBeforeLoad === null || !gpuBackendRunning()) return;
-  const v = await queryVram();
-  if (v) ourMiB = Math.max(ourMiB, v.usedMiB - usedBeforeLoad);
-}
-
 // Model for the CPU while the GPU is released (vramGuardCpuModel; "" = keep the configured one).
 // Default: the first of these that is in the models folder. The 4-bit 1.7B keeps nearly all of the
 // accuracy at about 1.5x the 0.6B's time; the 0.6B is the fast option (docs/asr-model-comparison.md).
@@ -293,28 +486,6 @@ function cpuFallbackModel() {
   if (!file || file === cfg.modelFile || !fs.existsSync(path.join(modelsDir, file))) return null;
   const m = describeModel(file);
   return m && m.engine === currentModel().engine && (m.engine !== "llama" || m.mmproj) ? m : null;
-}
-
-// pid -> dedicated GPU memory in MiB, or null when the counters cannot be read.
-function queryProcessVram() {
-  return new Promise((resolve) => {
-    execFile("typeperf", ["\\GPU Process Memory(*)\\Dedicated Usage", "-sc", "1"],
-      { timeout: 8000, windowsHide: true, maxBuffer: 8 * 1024 * 1024 }, (err, stdout) => {
-        if (err) return resolve(null);
-        const lines = String(stdout).split(/\r?\n/).filter((l) => l.startsWith('"'));
-        if (lines.length < 2) return resolve(null);
-        const cells = (l) => l.replace(/^"|"$/g, "").split('","');
-        const head = cells(lines[0]);
-        const vals = cells(lines[1]);
-        const per = new Map();
-        for (let i = 1; i < head.length; i++) {
-          const m = /pid_(\d+)_/.exec(head[i]);
-          const mib = Number(vals[i]) / 1048576;
-          if (m && Number.isFinite(mib)) per.set(Number(m[1]), Math.max(per.get(Number(m[1])) || 0, mib));
-        }
-        resolve(per);
-      });
-  });
 }
 
 let processNames = { at: 0, map: new Map() }; // pid -> image name without .exe
@@ -333,26 +504,39 @@ function refreshProcessNames(neededPids) {
     });
   });
 }
+const processName = (pid) => processNames.map.get(pid) || `pid ${pid}`;
 
-async function sampleHog() {
-  const per = await queryProcessVram();
-  perProcessOk = !!per;
-  if (!per) { hog = null; hogHits = 0; return; }
-  const big = [...per.entries()].filter(([pid, mib]) => mib >= GUARD.processMiB && !(child && pid === child.pid));
-  const names = big.length ? await refreshProcessNames(big.map(([pid]) => pid)) : processNames.map;
+// "ours" | "system" | "whitelist" | "over" (counts, above the threshold) | "" (counts, below it)
+function processKind(pid, name, mib, thresholdMiB) {
+  if (ownPids.has(pid)) return "ours";
+  if (SYSTEM_PROCESSES.test(name)) return "system";
+  if (isWhitelisted(name)) return "whitelist";
+  return thresholdMiB !== null && mib >= thresholdMiB ? "over" : "";
+}
+
+function findHog(card) {
+  const threshold = toMiB(guardProcessAmount(), card.totalMiB);
+  if (!card.procs || threshold === null) return null;
   let best = null;
-  for (const [pid, mib] of big) {
-    const name = names.get(pid) || `pid ${pid}`;
-    if (GUARD.ignore.test(name)) continue;
-    if (!best || mib > best.mib) best = { pid, name, mib: Math.round(mib) };
+  for (const [pid, mib] of card.procs) {
+    if (processKind(pid, processName(pid), mib, threshold) !== "over") continue;
+    if (!best || mib > best.mib) best = { pid, name: processName(pid), mib: Math.round(mib) };
   }
-  hog = best;
-  hogHits = best ? hogHits + 1 : 0;
+  return best;
+}
+
+function reasonText(lang) {
+  if (!backoffInfo) return null;
+  if (backoffInfo.kind === "hog") {
+    const gb = (backoffInfo.mib / 1024).toFixed(1);
+    return tr(lang, `${backoffInfo.name} 佔用 ${gb} GB`, `${backoffInfo.name} uses ${gb} GB`);
+  }
+  return tr(lang, `VRAM 只剩 ${backoffInfo.free} MiB`, `only ${backoffInfo.free} MiB of VRAM left`);
 }
 
 function clearBackoff(reason) {
   vramBackedOff = false;
-  backoffReason = null;
+  backoffInfo = null;
   backoffByScarcity = false;
   calmSince = null;
   lowFreeSince = null;
@@ -366,25 +550,37 @@ function clearBackoff(reason) {
 }
 
 async function guardTick() {
-  if (!cfg.vramGuard) { if (vramBackedOff) clearBackoff("guard switched off"); return; }
-  const v = await queryVram();
-  if (v) lastVram = v;
-  if (guardTicks++ % 2 === 0) await sampleHog(); // per-process data every 10 s
+  if (!cfg.vramGuard && vramBackedOff) clearBackoff("guard switched off");
+  if (!cfg.vramGuard && Date.now() - panelSeenAt > 15000) return;
+  await sampleGpu();
+  if (!gpuSample || !guardLuid()) { lastNvSmi = await queryNvSmi(); if (lastNvSmi) lastVram = lastNvSmi; }
+  if (!cfg.vramGuard) return;
+  const card = watchedCard();
+  // A model on an integrated GPU lives in system RAM and does not compete with games for VRAM.
+  if (isIntegratedCard(card)) {
+    hog = null;
+    hogHits = 0;
+    if (vramBackedOff) clearBackoff("the model uses an integrated GPU");
+    return;
+  }
+  hog = findHog(card);
+  hogHits = hog ? hogHits + 1 : 0;
   if (starting) return; // a load in progress distorts the numbers
   const now = Date.now();
-  const free = v ? v.totalMiB - v.usedMiB : null;
+  const free = card.totalMiB && card.usedMiB !== null ? card.totalMiB - card.usedMiB : null;
+  const minFree = toMiB(guardMinFreeAmount(), card.totalMiB) || 0;
   if (!vramBackedOff) {
-    const scarce = gpuBackendRunning() && free !== null && free < GUARD.minFreeMiB;
+    const scarce = gpuBackendRunning() && free !== null && free < minFree;
     lowFreeSince = scarce ? lowFreeSince || now : null;
     const byHog = !!hog && hogHits >= 2; // seen in two samples, i.e. for 10-20 s
-    const byScarcity = !!lowFreeSince && now - lowFreeSince >= GUARD.triggerMs;
+    const byScarcity = !!lowFreeSince && now - lowFreeSince >= GUARD_TRIGGER_MS;
     if (!(byHog || byScarcity) || inFlight > 0) return;
     vramBackedOff = true;
     backoffByScarcity = !byHog;
-    backoffReason = byHog ? `${hog.name} 佔用 ${(hog.mib / 1024).toFixed(1)} GB` : `VRAM 只剩 ${free} MiB`;
+    backoffInfo = byHog ? { kind: "hog", name: hog.name, mib: hog.mib } : { kind: "scarce", free };
     lowFreeSince = null;
     calmSince = null;
-    log(`VRAM guard: ${byHog ? `${hog.name} (pid ${hog.pid}) holds ${hog.mib} MiB of VRAM` : `only ${free} MiB of VRAM free`} - releasing the GPU; dictation uses the CPU meanwhile`);
+    log(`VRAM guard: ${byHog ? `${hog.name} (pid ${hog.pid}) holds ${hog.mib} MiB of VRAM` : `only ${free} MiB of VRAM free`} on ${card.name || "the GPU"} - releasing the GPU; dictation uses the CPU meanwhile`);
     clearTimeout(idleTimer);
     idleDeadline = null;
     if (child) stopBackend("VRAM guard");
@@ -398,29 +594,74 @@ async function guardTick() {
       }, 90000);
     }
   } else {
-    if (hog) backoffReason = `${hog.name} 佔用 ${(hog.mib / 1024).toFixed(1)} GB`;
+    if (hog) backoffInfo = { kind: "hog", name: hog.name, mib: hog.mib };
     // Back when no big VRAM user is left and the model fits again. After a scarcity-only back-off an
     // extra 1 GB of headroom is required, otherwise unloading itself would make room and it would flap.
-    const room = ourEstimate() + GUARD.minFreeMiB + (backoffByScarcity ? 1024 : 0);
+    const room = ourEstimate() + minFree + (backoffByScarcity ? 1024 : 0);
     const calm = !hog && (free === null || free >= room);
     if (!calm) { calmSince = null; return; }
     calmSince = calmSince || now;
-    if (now - calmSince >= GUARD.resumeMs && inFlight === 0) clearBackoff(`no large VRAM user left, ${free} MiB free`);
+    if (now - calmSince >= guardResumeMs() && inFlight === 0) clearBackoff(`no large VRAM user left, ${free} MiB free`);
   }
 }
 
-// gpu:N = CUDA build on NVIDIA GPU N; vulkan = Vulkan build (any GPU, ggml picks the device); cpu.
-// Which of these exist depends on the engine the current model needs.
+// What the tray's VRAM window shows. Answers at once from the last sample and starts a fresh one, so
+// the window (polling every few seconds) never waits on typeperf.
+function vramReport(lang) {
+  panelSeenAt = Date.now();
+  if (!sampling && (!gpuSample || Date.now() - gpuSample.at > 2500)) {
+    sampleGpu().then(() => { if (!gpuSample || !guardLuid()) return queryNvSmi().then((v) => { lastNvSmi = v; if (v) lastVram = v; }); }).catch(() => {});
+  }
+  const card = watchedCard();
+  const pAmount = guardProcessAmount();
+  const fAmount = guardMinFreeAmount();
+  const threshold = toMiB(pAmount, card.totalMiB);
+  const rows = [];
+  if (card.procs) {
+    for (const [pid, mib] of card.procs) {
+      if (mib < 10) continue;
+      const name = processName(pid);
+      let kind = processKind(pid, name, mib, threshold);
+      if (kind === "over" && vramBackedOff && backoffInfo && backoffInfo.kind === "hog" && backoffInfo.name === name) kind = "trigger";
+      rows.push({ pid, name, mib: Math.round(mib), kind });
+    }
+  }
+  rows.sort((a, b) => b.mib - a.mib);
+  return {
+    enabled: cfg.vramGuard,
+    backedOff: vramBackedOff,
+    reason: reasonText(lang),
+    sampled: !!card.procs,
+    sampledAt: gpuSample ? gpuSample.at : null,
+    card: { name: card.name, totalMiB: card.totalMiB, usedMiB: card.usedMiB, integrated: isIntegratedCard(card) },
+    processes: rows,
+    whitelist: cfg.vramGuardWhitelist,
+    ignoreRegex: cfg.vramGuardIgnore || null,
+    process: { unit: pAmount.unit, value: pAmount.value, mib: threshold },
+    minFree: { unit: fAmount.unit, value: fAmount.value, mib: toMiB(fAmount, card.totalMiB) },
+    resumeSeconds: guardResumeMs() / 1000,
+  };
+}
+
+// gpu:N = CUDA build on NVIDIA GPU N; vulkan = Vulkan build, cards chosen by ggml; vulkan:<card name> =
+// Vulkan build on that card only (llama.cpp models - whisper.cpp has no device list, so its models get
+// "vulkan"); cpu. Which of these exist depends on the engine the current model needs.
 function deviceList() {
   const engine = currentModel().engine;
   const list = [];
   if (findEngine(engine, "cuda")) gpus.forEach((g) => list.push({ id: `gpu:${g.index}`, name: g.name, memoryMiB: g.memoryMiB }));
-  if (findEngine(engine, "vulkan")) list.push({ id: "vulkan", name: "Vulkan", memoryMiB: null });
+  if (findEngine(engine, "vulkan")) {
+    list.push({ id: "vulkan", name: "Vulkan", memoryMiB: null });
+    if (engine === "llama") {
+      vulkanDevices.forEach((d) => list.push({ id: `vulkan:${d.name}`, name: d.name, memoryMiB: d.memoryMiB, integrated: isIntegrated(d.name) }));
+    }
+  }
   list.push({ id: "cpu", name: "CPU", memoryMiB: null });
   return list;
 }
 
-// What the next backend start will really use (the configured GPU may be gone, e.g. a laptop in eco mode).
+// What the next backend start will really use (the configured GPU may be gone, e.g. a laptop in eco mode
+// or an external GPU unplugged).
 function effectiveDevice() {
   const engine = currentModel().engine;
   if (cfg.device === "cpu" || vramBackedOff) return "cpu";
@@ -429,28 +670,48 @@ function effectiveDevice() {
     const wanted = Number(cfg.device.split(":")[1]);
     return gpus.some((g) => g.index === wanted) ? `gpu:${wanted}` : `gpu:${gpus[0].index}`;
   }
-  if (findEngine(engine, "vulkan")) return "vulkan";
+  if (findEngine(engine, "vulkan")) {
+    const card = vulkanCardName(cfg.device);
+    return card && engine === "llama" && vulkanDevices.some((d) => d.name === card) ? cfg.device : "vulkan";
+  }
   return "cpu";
 }
 
 // Shown in the tray menu: what is missing and where to get it.
-function problems() {
+function problems(lang) {
   const out = [];
+  const t = (zh, en) => tr(lang, zh, en);
   const model = currentModel();
-  if (!cfg.modelFile || !fs.existsSync(modelPath())) out.push(`找不到模型：models\\${cfg.modelFile || "(未設定)"}（見 README「模型」）`);
-  else if (model.engine === "llama" && !model.mmproj) out.push(`缺少 ${model.id} 的音訊編碼器（mmproj-*.gguf，與模型同一個 Hugging Face 頁面）`);
-  const gpuHint = model.engine === "llama" ? "把 llama.cpp 的 Vulkan 版解壓到 engine\\llama-vulkan\\" : "OpenWhispr →「啟用 GPU」";
-  if (!findEngine(model.engine, "cuda") && !findEngine(model.engine, "vulkan") && !findEngine(model.engine, "cpu")) {
-    out.push(model.engine === "llama" ? "找不到 llama.cpp 引擎：請安裝 OpenWhispr，或見 README「相依項目」" : "找不到辨識引擎：請安裝 OpenWhispr 並在其設定按「啟用 GPU」");
-  } else if (cfg.device !== "cpu" && !vramBackedOff && effectiveDevice() === "cpu") {
-    // Not while the GPU is released: that CPU use is deliberate and the tray title shows guardReason.
-    out.push(cudaBroken ? "GPU 引擎啟動失敗，暫時改用 CPU"
-      : !findEngine(model.engine, "cuda") ? `沒有 GPU 引擎（${gpuHint}），暫時改用 CPU`
-      : "偵測不到 NVIDIA GPU，暫時改用 CPU");
+  if (!cfg.modelFile || !fs.existsSync(modelPath())) {
+    out.push(t(`找不到模型：models\${cfg.modelFile || "(未設定)"}（見 README「模型」）`, `Model not found: models\${cfg.modelFile || "(not set)"} (see README, "Models")`));
+  } else if (model.engine === "llama" && !model.mmproj) {
+    out.push(t(`缺少 ${model.id} 的音訊編碼器（mmproj-*.gguf，與模型同一個 Hugging Face 頁面）`, `The audio encoder for ${model.id} is missing (mmproj-*.gguf, on the model's Hugging Face page)`));
   }
-  if (!findFfmpeg()) out.push("找不到 ffmpeg：請安裝 ffmpeg 並加入 PATH（或安裝 OpenWhispr）");
-  if (cfg.vramGuard && !perProcessOk) out.push("讀不到各程式的 VRAM 用量（typeperf），「讓出 GPU」只會在 VRAM 快滿時動作");
-  if (model.engine === "llama" && cfg.convertSimplified && scriptDictState === "missing") out.push("簡繁字典下載失敗（data\\opencc\\），簡體輸出暫不轉換");
+  const gpuHint = model.engine === "llama"
+    ? t("把 llama.cpp 的 Vulkan 版解壓到 engine\llama-vulkan\\", "unzip the Vulkan build of llama.cpp into engine\llama-vulkan\\")
+    : t("OpenWhispr 設定裡啟用 GPU", "enable the GPU in OpenWhispr's settings");
+  if (!findEngine(model.engine, "cuda") && !findEngine(model.engine, "vulkan") && !findEngine(model.engine, "cpu")) {
+    out.push(model.engine === "llama"
+      ? t("找不到 llama.cpp 引擎：請安裝 OpenWhispr，或見 README「相依項目」", "llama.cpp not found: install OpenWhispr, or see README, \"Dependencies\"")
+      : t("找不到辨識引擎：請安裝 OpenWhispr 並在其設定啟用 GPU", "No recognition engine found: install OpenWhispr and enable the GPU in its settings"));
+  } else if (cfg.device !== "cpu" && !vramBackedOff && effectiveDevice() === "cpu") {
+    // Not while the GPU is released: that CPU use is deliberate and the tray title shows the reason.
+    out.push(cudaBroken ? t("GPU 引擎啟動失敗，暫時改用 CPU", "The GPU engine failed to start; using the CPU for now")
+      : !findEngine(model.engine, "cuda") ? t(`沒有 GPU 引擎（${gpuHint}），暫時改用 CPU`, `No GPU engine (${gpuHint}); using the CPU for now`)
+      : t("偵測不到 NVIDIA GPU，暫時改用 CPU", "No NVIDIA GPU detected; using the CPU for now"));
+  } else if (vulkanCardName(cfg.device) && model.engine === "llama" && vulkanDevices.length && effectiveDevice() === "vulkan") {
+    const card = vulkanCardName(cfg.device);
+    out.push(t(`找不到指定的顯示卡（${card}），暫時自動選卡`, `The chosen card (${card}) is not there; choosing automatically for now`));
+  }
+  if (!findFfmpeg()) out.push(t("找不到 ffmpeg：請安裝 ffmpeg 並加入 PATH（或安裝 OpenWhispr）", "ffmpeg not found: install ffmpeg and add it to PATH (or install OpenWhispr)"));
+  if (cfg.vramGuard && !perProcessOk) {
+    out.push(t("讀不到各程式的 VRAM 用量（typeperf），「讓出 GPU」只會在 VRAM 快滿時動作", "Cannot read VRAM use per program (typeperf); yielding the GPU only reacts to VRAM running out"));
+  } else if (cfg.vramGuard && gpuSample && guardProcessAmount().unit === "%" && !watchedCard().totalMiB) {
+    out.push(t("讀不到這張卡的 VRAM 總量，百分比門檻暫時無效", "Cannot read this card's VRAM size; percentage thresholds are inactive"));
+  }
+  if (model.engine === "llama" && cfg.convertSimplified && scriptDictState === "missing") {
+    out.push(t("簡繁字典下載失敗（data\opencc\），簡體輸出暫不轉換", "The Simplified-to-Traditional dictionaries could not be downloaded (data\opencc\); output is left unconverted"));
+  }
   return out;
 }
 
@@ -499,7 +760,7 @@ function startBackend(device) {
   // While the GPU is released, the CPU runs a smaller sibling model if one is present (much faster there).
   const model = (useCpu && vramBackedOff && cpuFallbackModel()) || currentModel();
   const mPath = path.join(modelsDir, model.file);
-  const kind = useCpu ? "cpu" : device === "vulkan" ? "vulkan" : "cuda";
+  const kind = useCpu ? "cpu" : device.startsWith("vulkan") ? "vulkan" : "cuda";
   const exe = findEngine(model.engine, kind);
   const ffmpeg = findFfmpeg();
   if (!exe) return Promise.reject(new Error(`${model.engine} engine (${kind}) not found - see README`));
@@ -531,10 +792,20 @@ function startBackend(device) {
   // PCI_BUS_ID makes CUDA's device numbering match nvidia-smi's, which is what the menu shows.
   const childEnv = { ...process.env, PATH: `${path.dirname(ffmpeg)};${process.env.PATH}`, CUDA_DEVICE_ORDER: "PCI_BUS_ID" };
   if (model.engine === "llama" && kind === "cuda") childEnv.CUDA_VISIBLE_DEVICES = device.split(":")[1];
-  usedBeforeLoad = !useCpu && lastVram && Date.now() - lastVram.at < 15000 ? lastVram.usedMiB : null;
-  if (!useCpu) ourMiB = 0;
+  if (!useCpu) { ourMiB = 0; ourLuid = null; } // measured again from the GPU counters once it runs
+  const card = model.engine === "llama" ? vulkanCardName(device) : null;
+  if (!card) return spawnBackend(exe, args, childEnv, model, device, useCpu, t0);
+  return refreshVulkanDevices().then((list) => {
+    const d = list.find((x) => x.name === card);
+    if (!d) throw new Error(`Vulkan card "${card}" not found`);
+    return spawnBackend(exe, args.concat(["--device", `Vulkan${d.index}`]), childEnv, model, device, useCpu, t0);
+  });
+}
+
+function spawnBackend(exe, args, childEnv, model, device, useCpu, t0) {
   child = spawn(exe, args, { cwd: path.dirname(exe), env: childEnv, stdio: "ignore", windowsHide: true });
   const me = child;
+  if (child.pid) ownPids.add(child.pid);
   child.once("exit", (code) => {
     log(`${model.engine} server exited (code=${code})`);
     if (child === me) { child = null; ready = false; activeDevice = null; activeEngine = null; activeModelId = null; }
@@ -546,7 +817,6 @@ function startBackend(device) {
     activeModelId = model.id;
     chatUnreliable = false;
     chatNeedsPrefill = false;
-    if (!useCpu) setTimeout(measureOurVram, 5000);
     log(`${model.engine} server ready on ${device} (${model.file === cfg.modelFile ? model.id : model.file}) in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
   });
 }
@@ -560,7 +830,7 @@ function ensureBackend() {
     .catch((err) => {
       if (device === "cpu" || !findEngine(engine, "cpu") || !findFfmpeg() || !fs.existsSync(modelPath())) throw err;
       log(`${device} start failed (${err.message}); falling back to CPU for this session`);
-      if (device !== "vulkan") cudaBroken = true;
+      if (!device.startsWith("vulkan")) cudaBroken = true;
       stopBackend("gpu start failed");
       return startBackend("cpu");
     })
@@ -584,7 +854,7 @@ function armIdleTimer() {
   idleTimer = setTimeout(() => { if (inFlight === 0) stopBackend(`idle ${cfg.idleMinutes} min`); }, cfg.idleMinutes * 60000);
 }
 
-function status() {
+function statusFor(lang) {
   const model = currentModel();
   return {
     status: "ok",
@@ -600,10 +870,11 @@ function status() {
     allowRemote: cfg.allowRemote,
     punctuation: cfg.punctuation !== false,
     convertSimplified: cfg.convertSimplified,
+    uiLanguage: cfg.uiLanguage,
     vramGuard: cfg.vramGuard,
     backedOff: vramBackedOff,
     activeModel: activeModelId,
-    guardReason: backoffReason,
+    guardReason: reasonText(lang),
     guardHog: hog ? { name: hog.name, mib: hog.mib } : null,
     vram: lastVram,
     ourVramMiB: gpuBackendRunning() ? ourEstimate() : 0,
@@ -614,7 +885,7 @@ function status() {
     listening: [...listening.keys()],
     addresses: candidates.map((c) => ({ address: c.address, name: c.name })),
     port: cfg.port,
-    problems: problems(),
+    problems: problems(lang),
     inFlight,
     lastRequestAt,
     lastClient,
@@ -627,7 +898,10 @@ function status() {
 function handleControl(req, res, url) {
   const send = (code, obj) => { res.writeHead(code, { "Content-Type": "application/json" }); res.end(JSON.stringify(obj)); };
   const param = (name) => new URL(req.url, "http://x").searchParams.get(name) || "";
+  const lang = resolveLang(param("lang") || cfg.uiLanguage);
+  const status = () => statusFor(lang);
   if (req.method === "GET" && url === "/control/status") return send(200, status());
+  if (req.method === "GET" && url === "/control/vram") return send(200, vramReport(lang));
   if (req.method !== "POST") return send(405, { error: "method not allowed" });
 
   if (url === "/control/load") {
@@ -663,6 +937,38 @@ function handleControl(req, res, url) {
     if (!cfg.vramGuard && vramBackedOff) clearBackoff("guard switched off");
     return send(200, status());
   }
+  // Thresholds from the VRAM window: process / minFree = MiB or "N%" of the watched card; resume = seconds.
+  if (url === "/control/vram-guard-settings") {
+    const proc = parseAmount(param("process"));
+    const minFree = parseAmount(param("minFree"));
+    const resume = Number(param("resume"));
+    const okProc = proc && (proc.unit === "%" ? proc.value >= 1 && proc.value <= 100 : proc.value >= 100 && proc.value <= 1048576);
+    const okFree = minFree && (minFree.unit === "%" ? minFree.value <= 90 : minFree.value <= 1048576);
+    if (!okProc || !okFree || !(resume >= 5 && resume <= 3600)) {
+      return send(400, { error: "process: 100-1048576 (MiB) or 1-100%; minFree: 0-1048576 (MiB) or 0-90%; resume: 5-3600 s" });
+    }
+    const asConfig = (a) => (a.unit === "%" ? `${a.value}%` : Math.round(a.value));
+    persist({ vramGuardProcess: asConfig(proc), vramGuardMinFree: asConfig(minFree), vramGuardResumeSeconds: Math.round(resume),
+      vramGuardProcessMiB: undefined, vramGuardMinFreeMiB: undefined });
+    log(`VRAM guard thresholds: one program >= ${asConfig(proc)}, free < ${asConfig(minFree)}, resume after ${Math.round(resume)} s`);
+    hogHits = 0;
+    return send(200, vramReport(lang));
+  }
+  if (url === "/control/vram-whitelist") {
+    const name = param("name").trim().replace(/\.exe$/i, "");
+    if (!name || name.length > 100 || /[\x00-\x1f\\/:*?"<>|]/.test(name)) return send(400, { error: "name must be a program name without a path" });
+    const others = cfg.vramGuardWhitelist.filter((n) => String(n).toLowerCase() !== name.toLowerCase());
+    persist({ vramGuardWhitelist: param("add") === "false" ? others : [...others, name] });
+    log(`VRAM guard whitelist: ${cfg.vramGuardWhitelist.join(", ") || "(empty)"}`);
+    hogHits = 0;
+    return send(200, vramReport(lang));
+  }
+  if (url === "/control/ui-language") {
+    const value = param("value");
+    if (!["auto", "zh-TW", "en"].includes(value)) return send(400, { error: "value must be auto, zh-TW or en" });
+    persist({ uiLanguage: value });
+    return send(200, status());
+  }
   if (url === "/control/convert") {
     persist({ convertSimplified: param("enabled") === "true" });
     log(`simplified->traditional conversion ${cfg.convertSimplified ? "on" : "off"}`);
@@ -684,9 +990,11 @@ function handleControl(req, res, url) {
       if (describeModel(file).engine === "llama" && cfg.convertSimplified) loadScriptDicts();
     } else {
       const value = param("value");
-      if (value !== "cpu" && value !== "vulkan" && !/^gpu:\d+$/.test(value)) return send(400, { error: "value must be cpu, vulkan or gpu:N" });
+      if (!/^(cpu|vulkan|vulkan:[^\x00-\x1f]{1,200}|gpu:\d+)$/.test(value)) return send(400, { error: "value must be cpu, vulkan, vulkan:<card name> or gpu:N" });
       persist({ device: value });
       cudaBroken = false; // an explicit choice deserves a fresh GPU attempt
+      ourLuid = null;
+      refreshVulkanDevices();
       log(`device set to ${value}`);
     }
     clearTimeout(idleTimer);
@@ -1183,7 +1491,7 @@ function handle(req, res) {
   }
   if (req.method === "GET") {
     res.writeHead(200, { "Content-Type": "application/json" });
-    const s = status();
+    const s = statusFor(resolveLang(cfg.uiLanguage));
     res.end(JSON.stringify({ status: s.status, backend: s.backend, model: s.model, engine: s.engine }));
     return;
   }
@@ -1205,7 +1513,6 @@ function handle(req, res) {
     inFlight--;
     log(`${clientIp} transcription ${note} in ${((Date.now() - t0) / 1000).toFixed(2)}s`);
     armIdleTimer();
-    measureOurVram(); // the first inference allocates compute buffers on top of the weights
   };
 
   // Buffer the upload (dictation clips are small) while the backend warms up in parallel.
@@ -1249,9 +1556,11 @@ if (currentModel().engine === "llama" && cfg.convertSimplified) loadScriptDicts(
 loadVocabulary();
 loadLexicon(); // both files exist from the first start on, so the tray's "edit" items always have something to open
 setInterval(refreshListeners, 20000); // picks up ZeroTier coming up after logon
+refreshVulkanDevices();
 setInterval(refreshGpus, 120000); // a dGPU can appear / disappear (laptop eco mode)
-setInterval(() => { guardTick().catch((err) => log(`VRAM guard error: ${err.message}`)); }, 5000);
-setTimeout(() => { for (const p of problems()) log(`problem: ${p}`); }, 10000); // after the first GPU scan has answered
+setInterval(refreshVulkanDevices, 600000); // an external GPU plugged in later (also refreshed when the device menu changes)
+setInterval(() => { guardTick().catch((err) => log(`VRAM guard error: ${err.message}`)); }, 10000);
+setTimeout(() => { for (const p of problems("en")) log(`problem: ${p}`); }, 10000); // after the first GPU scan has answered
 // "Never unload" (idleMinutes 0) means the user wants the model resident: load it shortly after start so
 // the first dictation after a reboot does not pay the cold load (measured 23 s right after a power cut).
 if (!(cfg.idleMinutes > 0)) {

@@ -30,8 +30,8 @@ jobs:
         run: |
           $name = "WhisprGateway-$env:GITHUB_REF_NAME"
           New-Item -ItemType Directory -Force "dist\$name\models", "dist\$name\docs" | Out-Null
-          Copy-Item WhisprGateway.exe, whisper-gateway.js, gateway.config.default.json, README.md, LICENSE "dist\$name\"
-          Copy-Item models\README.md "dist\$name\models\"
+          Copy-Item WhisprGateway.exe, whisper-gateway.js, gateway.config.default.json, README.md, README.zh-TW.md, LICENSE "dist\$name\"
+          Copy-Item models\README*.md "dist\$name\models\"
           Copy-Item docs\*.md "dist\$name\docs\"
           Compress-Archive -Path "dist\$name" -DestinationPath "dist\$name.zip"
           $hash = (Get-FileHash "dist\$name.zip" -Algorithm SHA256).Hash.ToLower()

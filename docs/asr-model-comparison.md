@@ -1,5 +1,8 @@
 # 語音模型實測：台灣腔中英夾雜聽寫
 
+> **English summary.** Measured on 2026-09-30 (RTX 5080, i5-13600K, Windows 11, no vocabulary hints) with two test sets: 203 real dictation clips from one Taiwanese speaker mixing Chinese and English (about 80 minutes, not published), and 126 lecture clips from the public NTU ML2021 set. On the GPU, Qwen3-ASR-1.7B Q8 made the fewest errors on dictation (1.8% character error rate) and won blind A/B comparisons against Breeze-ASR-25 (42 : 12) and TEA-ASR-1.1 (20 : 14); Breeze-ASR-25 and TEA-ASR-1.1 did best on the lectures, which share their training data. On the CPU, Qwen3-ASR-1.7B Q4_K_M kept almost all of the accuracy (2.2%) and needed 2.8 s for a 17-second sentence, which is why it is the default CPU fallback. A curated list of 35 tech terms raised the share of English terms written correctly from 83% to 88%; longer lists did not help and pulled similar-sounding words toward the listed ones. The tables below give all models and numbers.
+
+
 測試日期 2026-09-30，RTX 5080＋i5-13600K，Windows 11。所有模型都不給詞彙提示。
 
 ## 考題與指標

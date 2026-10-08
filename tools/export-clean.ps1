@@ -2,18 +2,20 @@
 # the live config, private notes and binaries can never slip in), then scans the result for personal
 # traces. ASCII-only on purpose (PowerShell 5.1 + BOM-less files).
 #   .\tools\export-clean.ps1                       # -> ..\whispr-gateway-release
-#   .\tools\export-clean.ps1 -Target D:\somewhere
+#   .\tools\export-clean.ps1 -Target D:\somewhere -TracePatterns 'my-hostname', 'my-username'
+# The default patterns are generic (a user profile path, a gmail address); pass your own hostnames,
+# user names and network prefixes with -TracePatterns.
 param(
   [string]$Target = (Join-Path (Split-Path (Split-Path $PSScriptRoot)) "whispr-gateway-release"),
   [string[]]$TracePatterns = @('[A-Za-z]:\\Users\\[^\\%]+\\', '@gmail\.com')
 )
 $root = Split-Path $PSScriptRoot
 $public = @(
-  "README.md", "LICENSE", ".gitignore", "build.ps1", ".github\workflows\release.yml",
+  "README.md", "README.zh-TW.md", "LICENSE", ".gitignore", "build.ps1", ".github\workflows\release.yml",
   "whisper-gateway.js", "gateway.config.default.json",
   "src\GatewayTray.cs",
   "docs\openwhispr-notes.md", "docs\asr-model-comparison.md",
-  "models\README.md",
+  "models\README.md", "models\README.zh-TW.md",
   "tools\export-clean.ps1", "tools\test-model.ps1", "tools\test-host-endpoint.ps1",
   "tools\make-test-clip2.ps1", "tools\make-test-clip3.ps1", "tools\asr-matrix.py", "tools\idle-release.ps1",
   "tools\watch-guard.sh", "tools\top-vram.ps1"

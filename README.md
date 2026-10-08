@@ -1,161 +1,223 @@
+English | [繁體中文](README.zh-TW.md)
+
 # WhisprGateway
 
-**OpenWhispr 用的隨需載入語音辨識閘道** — 讓 [OpenWhispr](https://github.com/OpenWhispr/openwhispr) 用你自選的本機模型做聽寫：Qwen3-ASR 系列（GGUF）或 whisper.cpp 模型。模型**平時不佔 GPU**，可從系統匣切換模型／GPU／CPU，也能給區域網路或 VPN 上的其他電腦用。
+**An on-demand speech-to-text gateway for OpenWhispr.** It lets [OpenWhispr](https://github.com/OpenWhispr/openwhispr) dictate with a local model of your choice, either the Qwen3-ASR family (GGUF) or a whisper.cpp model. The model is loaded when you dictate and unloaded after 15 idle minutes (adjustable), so it does not sit in VRAM all day. From the tray you pick the model and the graphics card (or the CPU); optionally the gateway steps aside while a game needs the VRAM; other computers on your LAN or VPN can use it too. The interface is in English and Traditional Chinese.
 
-> *English summary:* a tiny Windows tray app + Node gateway that exposes an OpenAI-compatible `/v1/audio/transcriptions` endpoint for OpenWhispr's **self-hosted** mode. It runs llama.cpp's `llama-server` (Qwen3-ASR family GGUF + mmproj) or whisper.cpp's `whisper-server` (ggml), spawns the server only when a request arrives and unloads it after N idle minutes, lets you pick the model and GPU / CPU from the tray, can release the GPU while a game is running, converts Simplified output to Taiwan Traditional without rewriting vocabulary, tidies acronyms and numbers, and can serve other PCs on your LAN/VPN. Nothing large is bundled. UI and docs are in Traditional Chinese.
+Unofficial project, not affiliated with OpenWhispr, Alibaba Qwen or MediaTek. Developed and tested on Windows 11, OpenWhispr 1.9.1 and Node 26.7, with an NVIDIA RTX 5080 and with a laptop that has an RTX 5070 Ti Laptop GPU next to Intel integrated graphics. AMD and Intel Arc cards should work through Vulkan but have not been tested.
 
-非官方專案，與 OpenWhispr、阿里 Qwen、MediaTek 無關。開發與測試環境：Windows 11、OpenWhispr 1.9.1、Node 26.7、RTX 5080。
+## Why
 
-## 為什麼需要它
-
-OpenWhispr 1.9.1 的本機模式只能用內建的 6 個 Whisper 模型、模型一啟動就常駐在 GPU、不能給別台電腦用；選「中文（繁體）」時還會用 OpenCC「台灣用語」表改寫你的用詞（`數據→資料`、`參數→引數`…，見 [docs/openwhispr-notes.md](docs/openwhispr-notes.md)）。這個閘道補上這些，OpenWhispr 本身不用改——只要把轉錄模式切到「自架主機」。
+In OpenWhispr 1.9.1 the local mode offers only its six built-in Whisper models. A model stays resident on the GPU from the moment the app starts, and other computers cannot use it. This gateway fills those gaps without changing OpenWhispr: switch its transcription mode to "Self-Hosted" and point it here.
 
 ```
-OpenWhispr（模式＝自架主機；同一台或別台電腦）
-   └─ POST http://<這台的位址>:8790/v1/audio/transcriptions
-        └─ whisper-gateway.js（Node，常駐、幾乎不耗資源）
-             └─ 有請求才啟動辨識伺服器（127.0.0.1:8791）＋模型，閒置後結束
-                  *.gguf → llama.cpp llama-server（Qwen3-ASR / TEA-ASR）
-                  *.bin  → whisper.cpp whisper-server（Breeze-ASR-25 / Whisper）
-WhisprGateway.exe = 系統匣圖示（語）：看管閘道 + 手動控制
+OpenWhispr (mode = Self-Hosted; this PC or another one)
+   └─ POST http://<this PC>:8790/v1/audio/transcriptions
+        └─ whisper-gateway.js (Node, always running, next to no resources)
+             └─ starts the recognition server (127.0.0.1:8791) + model on demand, stops it when idle
+                  *.gguf → llama.cpp llama-server (Qwen3-ASR / TEA-ASR)
+                  *.bin  → whisper.cpp whisper-server (Breeze-ASR-25 / Whisper)
+WhisprGateway.exe = tray icon: supervises the gateway, manual control
 ```
 
-## 模型
+## Quick start
 
-| 模型 | 引擎 | 大小 | 特點 |
+The shortest path, with the recommended model on any GPU through Vulkan:
+
+1. Install **Node.js 20 LTS or later** from <https://nodejs.org>.
+2. Download `WhisprGateway-vX.Y.Z.zip` from **Releases** and unzip it into a folder you can write to, for example `%LOCALAPPDATA%\WhisprGateway`. Not `Program Files`: the app keeps its config and log next to the exe.
+3. Download llama.cpp's Vulkan build, `llama-bNNNN-bin-win-vulkan-x64.zip` (b11178 or later), from <https://github.com/ggml-org/llama.cpp/releases> and unzip it so that `engine\llama-vulkan\llama-server.exe` exists.
+4. Open PowerShell in the `models` folder and run the first two `curl.exe` lines from [models/README.md](models/README.md) (the model and its audio encoder, 2.5 GB together).
+5. ffmpeg comes with OpenWhispr; without OpenWhispr on this PC, run `winget install Gyan.FFmpeg`.
+6. Run `WhisprGateway.exe`. The exe is not signed, so SmartScreen may ask first: "More info" → "Run anyway" (or build it yourself, see "Build from source"). A round icon with the character 語 appears in the tray; on Windows 11 it may be hidden behind the ^ arrow.
+7. Click the icon → "OpenWhispr settings…" and enter in OpenWhispr:
+   - Settings → Speech-to-Text → **Self-Hosted** → Endpoint URL `http://127.0.0.1:8790/v1` (leave API key and model name empty).
+   - Preferences → Transcription language → **Auto**. If you dictate Chinese, also set Chinese script (dictation) → **Keep as transcribed**; "Chinese (Traditional)" there makes OpenWhispr rewrite your vocabulary with OpenCC's Taiwan phrases table (details in [docs/openwhispr-notes.md](docs/openwhispr-notes.md)).
+8. Dictate. The first request loads the model (a few seconds); right after installing, the very first one can take 20 seconds or more while the graphics driver compiles its shaders.
+
+To start with Windows, tick "Start at sign-in" in the menu. The language follows the Windows display language; "語言 / Language" in the menu switches it.
+
+After these steps the folder looks like this:
+
+```
+WhisprGateway\
+  WhisprGateway.exe, whisper-gateway.js, gateway.config.default.json, README.md …
+  gateway.config.json, gateway.log            created on the first run
+  engine\llama-vulkan\llama-server.exe        + the other files of that zip
+  models\Qwen3-ASR-1.7B-Q8_0.gguf
+  models\mmproj-Qwen3-ASR-1.7B-Q8_0.gguf
+  data\                                       created on the first run (vocabulary, dictionaries)
+```
+
+## Models
+
+| Model | Engine | Size | Notes |
 |---|---|---|---|
-| **Qwen3-ASR-1.7B**（推薦） | llama.cpp | Q8 2.17 GB 或 Q4_K_M 1.28 GB ＋ mmproj 0.36 GB | 台灣口音與中英夾雜都不需微調，自帶標點；輸出簡體，由閘道轉成台灣繁體字形（只轉字、不換詞） |
-| Qwen3-ASR-0.6B | llama.cpp | 0.80 GB ＋ mmproj 0.21 GB | CPU 上最快，錯字約是 1.7B 的兩倍 |
-| TEA-ASR-1.1 | llama.cpp | Q6_K 1.42 GB ＋ mmproj 0.36 GB | Qwen3-ASR-1.7B 的台灣微調，原生繁體＋台灣用字 |
-| Breeze-ASR-25 | whisper.cpp | q8_0 1.66 GB | MediaTek 台灣華語微調；標點由閘道依停頓補上；只需要 OpenWhispr 的引擎 |
+| **Qwen3-ASR-1.7B** (recommended) | llama.cpp | Q8 2.17 GB or Q4_K_M 1.28 GB + mmproj 0.36 GB | 30 languages, detects the language by itself, punctuates; handles Taiwanese accents and mixed Chinese-English speech without fine-tuning. Chinese comes out in Simplified characters, which the gateway converts to Taiwan Traditional (characters only, no vocabulary changes) |
+| Qwen3-ASR-0.6B | llama.cpp | 0.80 GB + mmproj 0.21 GB | Fastest on the CPU, about twice the errors of the 1.7B |
+| TEA-ASR-1.1 | llama.cpp | Q6_K 1.42 GB + mmproj 0.36 GB | Qwen3-ASR-1.7B fine-tuned for Taiwanese Mandarin; writes Traditional characters and Taiwanese wording |
+| Breeze-ASR-25 | whisper.cpp | q8_0 1.66 GB | MediaTek's Taiwanese Mandarin fine-tune of Whisper; the gateway adds punctuation from pauses; needs only OpenWhispr's engine |
 
-下載指令與 sha256 見 [models/README.md](models/README.md)；各模型的實測比較見 [docs/asr-model-comparison.md](docs/asr-model-comparison.md)。**更換模型＝把檔案放進 `models\`，再從系統匣「模型」選它。**
+GGUF (`*.gguf`) is llama.cpp's model format and ggml (`*.bin`) is whisper.cpp's. A Qwen3-ASR model needs its **mmproj** file, the audio encoder, next to it. Q8, Q6_K and Q4_K_M are quantization levels: the higher the number, the larger the file and the closer to the original accuracy. Download commands and sha256 sums are in [models/README.md](models/README.md); a measured comparison of these and other models is in [docs/asr-model-comparison.md](docs/asr-model-comparison.md) (Traditional Chinese, with an English summary). To change models, put the files into `models\` and pick the model from the tray's "Model" menu.
 
-## 相依項目（**不內附**，請自行準備）
+## Dependencies in detail
 
-程式本身只有幾十 KB；引擎、ffmpeg、模型都不隨附，啟動時依下列順序自動尋找。缺少時，系統匣選單會以紅字顯示缺什麼。
+Nothing large is bundled: the app itself is about 140 KB. At start it looks for each dependency in the order below; paths are relative to the folder of `WhisprGateway.exe`.
 
-| 相依 | 需求 | 尋找順序 | 怎麼取得 |
+| Dependency | Needs | Looked up in | Where to get it |
 |---|---|---|---|
-| **Node.js** | 18.2 以上 | `runtime\node.exe` → PATH | <https://nodejs.org> |
-| **llama.cpp**（GGUF 模型用） | `llama-server`，b11178 以上 | `engine\llama-vulkan\` → OpenWhispr 的 `%APPDATA%\open-whispr\bin\llama-vulkan\` → `engine\llama-cpu\` → OpenWhispr 內附的 CPU 版 | 從 <https://github.com/ggml-org/llama.cpp/releases> 下載 `llama-bNNNN-bin-win-vulkan-x64.zip` 解壓到 `engine\llama-vulkan\`（Vulkan 版適用任何廠牌的 GPU）。只裝了 OpenWhispr 也能跑（用它內附的 CPU 版），只是慢。要用 CUDA：把 `-cuda-12.4-x64.zip` 與 `cudart-llama-bin-win-cuda-12.4-x64.zip` 解壓到 `engine\llama-cuda\`，存在時優先使用 |
-| **whisper.cpp**（ggml 模型用） | `whisper-server` | `engine\whisper-cuda\` → `%APPDATA%\open-whispr\bin\whisper-cuda\`（Vulkan、CPU 類推） | OpenWhispr → 設定 → 語音轉文字 → 本機 →「啟用 GPU」，閘道直接借用；或從 <https://github.com/OpenWhispr/whisper.cpp/releases> 自取 |
-| **ffmpeg** | 4.0 以上、含 opus 解碼 | `engine\ffmpeg\ffmpeg.exe` → PATH → OpenWhispr 內附的 ffmpeg-static | 裝了 OpenWhispr 就有；或 `winget install Gyan.FFmpeg` |
-| **模型** | 見上表 | `models\` | [models/README.md](models/README.md) |
-| OpenCC 字典（簡→繁用） | 3 個文字檔約 1 MB | `data\opencc\` | 第一次需要時自動從 OpenCC 的 GitHub 下載 |
+| **Node.js** | 20 or later | `runtime\node.exe` → PATH | <https://nodejs.org> |
+| **llama.cpp** (GGUF models) | `llama-server`, b11178 or later | `engine\llama-cuda\` (if present) → `engine\llama-vulkan\` → OpenWhispr's `%APPDATA%\open-whispr\bin\llama-vulkan\` → `engine\llama-cpu\` → the CPU build bundled with OpenWhispr | The Vulkan build `llama-bNNNN-bin-win-vulkan-x64.zip` runs on any GPU vendor. For CUDA on NVIDIA, unzip `llama-bNNNN-bin-win-cuda-12.4-x64.zip` and `cudart-llama-bin-win-cuda-12.4-x64.zip` into `engine\llama-cuda\`. With only OpenWhispr installed it still works, on the CPU and slowly |
+| **whisper.cpp** (ggml models) | `whisper-server-win32-x64-cuda.exe` / `-vulkan.exe` / `whisper-server-win32-x64.exe` | GPU builds: `engine\whisper-cuda\` or `engine\whisper-vulkan\` → OpenWhispr's `%APPDATA%\open-whispr\bin\whisper-cuda\` or `whisper-vulkan\`. CPU build: `engine\whisper-cpu\` → OpenWhispr's install folder | OpenWhispr → Settings → Speech-to-Text → Local → "Enable GPU" installs the CUDA build on NVIDIA and the Vulkan build elsewhere; the gateway borrows it. Or get it from <https://github.com/OpenWhispr/whisper.cpp/releases> |
+| **ffmpeg** | 4.0 or later with opus decoding | `engine\ffmpeg\ffmpeg.exe` → PATH → the ffmpeg-static bundled with OpenWhispr | Comes with OpenWhispr; or `winget install Gyan.FFmpeg` |
+| **Models** | see above | `models\` | [models/README.md](models/README.md) |
+| OpenCC dictionaries (Simplified → Traditional) | 3 text files, about 1 MB | `data\opencc\` | Downloaded from OpenCC's GitHub the first time they are needed |
 
-> 借用 OpenWhispr 的引擎時，若在 OpenWhispr 裡刪除 GPU 引擎或解除安裝 OpenWhispr，閘道會退回 CPU 或無法辨識。
+> When the gateway borrows OpenWhispr's engines, removing the GPU engine in OpenWhispr or uninstalling OpenWhispr makes the gateway fall back to the CPU or stop recognizing.
 
-## 安裝
+### Serving other computers
 
-1. 準備上表的相依。
-2. 取得程式：從 **Releases** 下載 `WhisprGateway-vX.Y.Z.zip` 解壓（GitHub Actions 由該版本的原始碼自動編譯）。也可以 clone 後執行 `build.ps1`（用 Windows 內建的 C# 編譯器，不需要 SDK）。
-3. 執行 `WhisprGateway.exe`。系統匣出現「語」圖示；第一次執行會產生 `gateway.config.json`，到「模型」選單選你下載的模型。
-4. 點圖示 →「OpenWhispr 要填什麼…」，照著在 OpenWhispr 填：
-   - 設定 → 語音轉文字 → **自架主機** → 端點 URL `http://127.0.0.1:8790/v1`（API Key、模型名稱留空）。
-   - 偏好設定 → 轉錄語言 → **自動**；中文書寫 → **保持轉錄原樣**。**不要選「中文（繁體）」**，那會讓 OpenWhispr 改寫你的用詞。
-5. 要跟著系統啟動，就在選單勾「開機（登入）時自動啟動」。
+With "Allow other computers (LAN / VPN)" ticked, the gateway binds every private address of this PC and admits only clients from those same subnets; without it, it listens on `127.0.0.1` only. On the other computer, enter `http://<address>:8790/v1` in OpenWhispr.
 
-### 給其他電腦用
+- The first time, Windows Firewall asks about **Node.js**; allow **private networks** only.
+- **There is no API key.** Anyone on the same subnet can use the gateway: everyone on the same café Wi-Fi, or everyone on your Tailscale or ZeroTier network. Leave this off on networks you do not trust, never forward the port to the internet, and use `remoteInterfaces` to limit it to particular adapters.
 
-勾選「允許其他電腦連線（區域網路／VPN）」後，閘道會綁定這台電腦所有私有網段的位址，並只放行同網段的來源；沒勾時只聽 `127.0.0.1`。在另一台電腦的 OpenWhispr 填 `http://<位址>:8790/v1`。
+## Tray menu
 
-- 第一次開啟時 Windows 可能詢問防火牆，請只允許**私人網路**。
-- **沒有 API Key**：安全性來自「只綁私有位址＋只放行同網段」，不要把這個埠轉發到網際網路。可用 `remoteInterfaces` 限定只走某個介面。
-
-## 系統匣選單
-
-| 項目 | 作用 |
+| Item | What it does |
 |---|---|
-| 立即載入／立即卸載 | 手動控制模型是否佔用資源 |
-| 閒置自動卸載 | 5／15／30／60 分鐘／不自動卸載（選這個時，啟動後會先把模型載好） |
-| 模型 | 列出 `models\` 內的 `*.bin` 與 `*.gguf`（mmproj 自動配對） |
-| 運算裝置 | 各張 NVIDIA GPU、Vulkan、純 CPU。指定的 GPU 不在時自動退到其他裝置 |
-| VRAM 不足時自動讓出 GPU | 見「讓出 GPU」；預設關閉 |
-| 自動補標點（whisper 模型） | 見「標點符號」；預設開啟 |
-| 簡體輸出轉台灣繁體（Qwen3-ASR 系列） | OpenCC s2tw 字形轉換，不做用語替換；預設開啟 |
-| 詞彙（Qwen3-ASR 系列） | 開啟 `data\vocabulary.txt`（詞彙提示）或 `data\taiwan-lexicon.txt`（替換表）；存檔即生效 |
-| 允許其他電腦連線 | 見上節；預設關閉 |
-| OpenWhispr 要填什麼… | 顯示端點網址，可一鍵複製 |
-| 開機（登入）時自動啟動 | 建立工作排程器的 `WhisprGateway` 工作（登入後 20 秒啟動，每 5 分鐘檢查一次是否還在執行） |
+| Load / Unload model now | Manual control over whether the model holds resources |
+| Unload when idle | 5 / 15 (default) / 30 / 60 minutes / never; with "never" the model is loaded about 30 s after the gateway starts |
+| Model | The `*.bin` and `*.gguf` files in `models\` (mmproj files are paired automatically) |
+| Device | Each NVIDIA GPU (CUDA), Vulkan choosing automatically, Vulkan on one particular card, CPU only. See "Choosing the graphics card" |
+| Yield the GPU to other programs | On/off, and the "VRAM usage, whitelist and thresholds" window. See "Yielding the GPU"; off by default |
+| Add punctuation from pauses (whisper models) | See "Punctuation"; on by default |
+| Convert Simplified output to Taiwan Traditional (Qwen3-ASR family) | OpenCC s2tw: character conversion only, no vocabulary changes; on by default |
+| Vocabulary (Qwen3-ASR family) | Opens `data\vocabulary.txt` (vocabulary hints) or `data\taiwan-lexicon.txt` (replacement table); saved changes apply at once |
+| Allow other computers | See above; off by default |
+| OpenWhispr settings… | Shows the endpoint URLs with copy buttons |
+| Start at sign-in | Creates the Task Scheduler task `WhisprGateway` (starts 20 s after sign-in, checks every 5 minutes that it is still running) |
+| 語言 / Language | Automatic (Windows display language), 繁體中文, English |
+| Open log / Restart gateway / Quit | `gateway.log` in Notepad / restart the Node gateway / stop everything and free the GPU |
 
-圖示顏色：綠＝模型在 GPU 上、藍＝目前用 CPU 辨識、橘＝載入中、灰＝未載入、紅＝閘道沒回應。
+Icon colors: green = model on the GPU, blue = dictation runs on the CPU, orange = loading, grey = not loaded, red = gateway not responding.
 
-## 效能
+## Troubleshooting
 
-RTX 5080，模型已載入時：
+When something is missing, the tray menu shows it in red under the status line, one problem at a time; clicking it opens this README. Fix it and the next one, if any, appears.
 
-| 模型 | 載入 | 每句 | VRAM |
-|---|---|---|---|
-| Qwen3-ASR-1.7B Q8_0 | 約 3 秒 | 0.3–0.4 秒 | 約 3 GB |
-| Qwen3-ASR-0.6B Q8_0 | 約 2 秒 | 0.25 秒 | 約 1.9 GB |
-| TEA-ASR-1.1 Q6_K | 約 3 秒 | 0.3–0.8 秒 | 約 2.8 GB |
-| Breeze-ASR-25 q8_0 | 約 2 秒 | 0.75 秒 | 約 2.3 GB |
-
-閘道本身（系統匣＋Node）約佔 60 MB RAM。
-
-## 功能說明
-
-### 讓出 GPU
-
-開遊戲、LM Studio 這類吃 VRAM 的程式時，閘道可以自動卸下模型：
-
-- 每 10 秒讀一次 Windows 的「GPU Process Memory」計數器。有單一程式佔用 ≥ 2 GB（`vramGuardProcessMiB`），或剩餘 VRAM < 1 GB（`vramGuardMinFreeMiB`）→ 讓出 GPU。
-- 讓出期間聽寫改用 CPU，並換成較小的檔案（`vramGuardCpuModel`）：預設先找 `Qwen3-ASR-1.7B.Q4_K_M.gguf`，再找 `Qwen3-ASR-0.6B-Q8_0.gguf`。
-- 那個程式離開 60 秒後（`vramGuardResumeSeconds`）回到 GPU。
-- `dwm` 與 NVIDIA Overlay 不算；其他要排除的程式用 `vramGuardIgnore`。
-
-`bash tools/watch-guard.sh` 可即時觀察它的動作。
-
-### 詞彙提示（Qwen3-ASR 系列）
-
-閘道把一份詞彙表當 system prompt 送給模型，讓英文術語寫回英文（例如「酷達」→ CUDA）。
-
-- 常見科技名詞已內建 35 個（VRAM、NVIDIA、repo、GitHub…；`builtinVocabulary: false` 可關）。
-- `data\vocabulary.txt` 放你自己常講、而模型常寫錯的詞，一行一個。
-- 不要放模型本來就寫得對的短詞（GPU、AI、API）：列出來的詞會把發音相近的字吸過去。總數上限 100。
-
-### 縮寫與數字（Qwen3-ASR 系列）
-
-- 被拆開的縮寫會合併：`G P U`→`GPU`、`N V I D I A`→`NVIDIA`
-- 國字數字在確定是數字時轉成阿拉伯數字：`RTX 五零八零`→`RTX 5080`、`DLSS 五`→`DLSS 5`、`十六 GB`→`16 GB`、`三十秒`→`30秒`、`九月十一號`→`9月11號`、`百分之二十`→`20%`
-- 不動的：`一個`、`兩顆`、`一點`、`萬一`、`十分`、`一二三`、`十幾個`
-
-個別的詞可以用替換表 `data\taiwan-lexicon.txt` 修（每行「模型寫法、Tab、改成」），預設內容是把「網絡、軟件、服務器」這類用詞改回台灣說法。
-
-### 標點符號（whisper 模型）
-
-Breeze-ASR-25 幾乎不輸出標點，但它的分段剛好切在子句邊界，所以由閘道補：疑問結尾（嗎／呢／是不是…）→「？」；下一段以「另外／首先／最後…」開頭、停頓 ≥ 0.7 秒或最後一段 →「。」；其餘 →「，」。Qwen3-ASR 系列自帶標點。
-
-## 設定檔 `gateway.config.json`
-
-| 欄位 | 說明 |
+| Message or symptom | What to do |
 |---|---|
-| `port` / `backendPort` | 對外 8790／內部 8791 |
-| `listen` | `"auto"`＝127.0.0.1＋（允許外部連線時）本機所有私有 IPv4 位址；也可寫成位址陣列 |
-| `remoteInterfaces` | 介面名稱的正規表示式，空字串＝全部（例：`zerotier|tailscale`） |
-| `allowCidrs` | `"auto"`＝上述介面所在網段；也可寫成 CIDR 陣列 |
-| `allowRemote`、`idleMinutes`、`device`、`modelFile`、`punctuation`、`convertSimplified`、`vramGuard` | 由系統匣選單寫入 |
-| `vramGuardProcessMiB`、`vramGuardMinFreeMiB`、`vramGuardResumeSeconds` | 讓出 GPU 的門檻（預設 2000、1024、60） |
-| `vramGuardIgnore` | 額外不算的程式名稱（正規表示式，不含 .exe，例如 `^(chrome|obs64)$`） |
-| `vramGuardCpuModel` | 讓出 GPU 期間在 CPU 上用的模型檔；空字串＝用原本的模型 |
-| `builtinVocabulary` | `false`＝不送內建的科技名詞 |
-| `language` | 辨識語言（`zh`、`auto`…） |
-| `prompt` | 只給 whisper 模型的提示詞 |
-| `llamaInstruction` | 給 Qwen3-ASR 系列的指示句（system prompt 第一行） |
-| `llamaMode` | `chat`（預設，會帶詞彙提示）或 `transcriptions` |
-| `llamaContext`、`llamaMaxTokens` | llama-server 的 context 長度（預設 8192）與單次輸出上限（預設 2048） |
-| `modelsDir`、`engineDir`、`dataDir`、`tmpDir` | 相對路徑＝相對於本資料夾 |
+| Model not found: models\… | Put that file into `models\`, or pick a model you have under "Model" |
+| The audio encoder for … is missing | Download the model's `mmproj-*.gguf` from the same Hugging Face page into `models\` |
+| llama.cpp not found / No recognition engine found | Quick start step 3 (or install OpenWhispr and enable its GPU engine for whisper models) |
+| No GPU engine (…); using the CPU for now | Dictation works but slowly; install the Vulkan build as in step 3 |
+| The GPU engine failed to start; using the CPU for now | Update the graphics driver, check `gateway.log` ("Open log"), then choose the device again or "Restart gateway" |
+| The chosen card (…) is not there; choosing automatically for now | The card picked under "Device" is gone (an external GPU unplugged, say); pick another one |
+| ffmpeg not found | Quick start step 5 |
+| The Simplified-to-Traditional dictionaries could not be downloaded | Needs internet once; or turn off "Convert Simplified output…" |
+| Cannot read VRAM use per program (typeperf) | Yielding then only reacts to VRAM running out. The GPU counters need Windows 10 version 1709 or later; if they are broken, `lodctr /r` in an administrator prompt rebuilds Windows' performance counters |
+| Red icon, "the gateway does not respond" | Node.js missing (a notification says so), or port 8790 taken by another program; see "Open log" |
+| A "Cannot create the config file" message at start | The folder is not writable; move the app out of `Program Files` |
 
-執行中只有閘道會寫這個檔；要手改請先從選單「結束」。`/control/*` 只接受本機呼叫。`gateway.log` 只記時間、來源 IP、耗時，不記辨識內容。
+## Performance
 
-## 其他
+Measured on an RTX 5080. "Load" is the time from the first request to a ready model; "Per sentence" is with the model already loaded.
 
-- 自架模式沒有「即時轉錄預覽」，OpenWhispr 內的自訂字典也不會送出（用上面的詞彙提示代替）。
-- 僅支援 Windows；自啟動是「登入時」。
-- `src\GatewayTray.cs` 是系統匣程式（C# 5）。重編前先 `schtasks /Change /TN WhisprGateway /DISABLE` 並結束 exe，編完再 `/ENABLE`、`/Run`。
-- `tools\`：測試與觀察用的腳本。
+| Model | Load | Per sentence | VRAM |
+|---|---|---|---|
+| Qwen3-ASR-1.7B Q8_0 | about 3 s | 0.3–0.4 s | about 3 GB |
+| Qwen3-ASR-0.6B Q8_0 | about 2 s | 0.25 s | about 1.9 GB |
+| TEA-ASR-1.1 Q6_K | about 3 s | 0.3–0.8 s | about 2.8 GB |
+| Breeze-ASR-25 q8_0 | about 2 s | 0.75 s | about 2.3 GB |
 
-## 致謝
+On the CPU (i5-13600K, 10 threads), Qwen3-ASR-1.7B Q4_K_M takes about 2.8 s for a 17-second sentence. The gateway itself (tray + Node) uses about 60 MB of RAM.
 
-[OpenWhispr](https://github.com/OpenWhispr/openwhispr)、[llama.cpp](https://github.com/ggml-org/llama.cpp)、[whisper.cpp](https://github.com/ggml-org/whisper.cpp)、[Qwen3-ASR](https://github.com/QwenLM/Qwen3-ASR)、[JacobLinCool 的 TEA-ASR](https://huggingface.co/JacobLinCool/TEA-ASR-1.1)、[mradermacher 的 GGUF 量化](https://huggingface.co/mradermacher/TEA-ASR-1.1-GGUF)、[MediaTek Research Breeze-ASR-25](https://huggingface.co/MediaTek-Research/Breeze-ASR-25)、[shdennlin 的 ggml 轉檔](https://huggingface.co/shdennlin/breeze-asr-25-ggml)、[OpenCC](https://github.com/BYVoid/OpenCC)。
+## Features
+
+### Yielding the GPU
+
+When a game, LM Studio or anything else needs the VRAM, the gateway can unload the model and dictate on the CPU until that program has exited, then return to the GPU. It is off by default; turn it on under "Yield the GPU to other programs".
+
+Every 10 seconds the gateway reads Windows' GPU memory counters, which exist for every GPU vendor. It only looks at the card the model uses, so a game on another card does not count. It yields when either condition holds:
+
+- One program uses more VRAM than the threshold in two samples in a row, about 10–20 seconds. Default 2 GB.
+- While the model is on the GPU, free VRAM stays below the threshold for 10 seconds. Default 1 GB; 0 turns this condition off.
+
+Both thresholds can be set in GB or as a share of the card (for example 15%), which is easier to get right across cards of different sizes. While the GPU is yielded, dictation runs on the CPU with a smaller file (`vramGuardCpuModel`): by default `Qwen3-ASR-1.7B.Q4_K_M.gguf` if present, else `Qwen3-ASR-0.6B-Q8_0.gguf`, else the configured model. After the program exits, the gateway waits 60 seconds (adjustable) before it uses the GPU again.
+
+Tray → "Yield the GPU to other programs" → "VRAM usage, whitelist and thresholds…" opens a window that lists, every 3 seconds, each program on that card with its VRAM use and share, marking which programs are above the threshold and which one caused the yield. The thresholds and the waiting time are set there as well.
+
+**Whitelist**: tick a program in the list and it may use any amount of VRAM without the gateway giving way, which suits programs that are always open, such as OBS or a browser. Programs that are not running can be added by name. The whitelist starts empty; what goes on it is up to you. Windows' own desktop processes (dwm, csrss) never count, because their counters grow with the number and resolution of your monitors.
+
+A model on an integrated GPU never yields: it lives in system RAM and does not compete with games for VRAM. The gateway treats a card as integrated when Windows reports less than 1 GB of dedicated memory for it, which fits Intel integrated graphics; AMD APUs that reserve more than that are treated like discrete cards.
+
+### Choosing the graphics card
+
+"Device" lists every card the Vulkan engine sees, integrated graphics included. With two discrete cards llama.cpp splits the model across both by default; choosing one keeps it on that card. You can also put the model on the integrated GPU and leave the discrete card entirely to games.
+
+Vulkan numbers the cards according to their current state: on the test laptop the Intel and NVIDIA cards swapped numbers within minutes. The config therefore stores the card's name (`vulkan:<name>`), and the gateway looks up its current number right before each start. Two cards with the same name cannot be told apart; the first one is used. This applies to the Qwen3-ASR family (llama.cpp); for whisper models, whisper.cpp picks the Vulkan card itself.
+
+### Dictating in English or other languages
+
+The Qwen3-ASR family detects the language of each recording; in a test on 2026-10-08, Qwen3-ASR-1.7B transcribed an English recording correctly with the default settings. For English-only use, set these in `gateway.config.json` (choose "Quit" first): `"language": "auto"` (the default `zh` is used whenever OpenWhispr sends no language, which matters for whisper models and TEA-ASR), `"llamaInstruction": ""` (the default instruction tells Qwen3-ASR to expect Taiwanese Chinese) and `"prompt": ""` (a Chinese hint for whisper models). If you want Simplified Chinese, turn off "Convert Simplified output…". The rest of the clean-up only touches Chinese text, except that letters spelled out one by one are joined into one word ("G P U" → "GPU").
+
+### Vocabulary hints (Qwen3-ASR family)
+
+The gateway sends a vocabulary list to the model as its system prompt, so that technical terms come back in their usual spelling (CUDA rather than a phonetic rendering in Chinese).
+
+- 35 terms are built in: AI tools, GPU and developer words such as VRAM, NVIDIA, repo, GitHub, Claude (the list is `BUILTIN_VOCABULARY` in `whisper-gateway.js`; `builtinVocabulary: false` turns it off).
+- Put the words you say often and the model gets wrong into `data\vocabulary.txt`, one per line.
+- Leave out short words the model already gets right (GPU, AI, API): listed words attract similar-sounding ones. At most 100 terms in total.
+
+### Acronyms and numbers (Qwen3-ASR family, Chinese)
+
+- Acronyms said letter by letter are joined: `G P U` → `GPU`, `N V I D I A` → `NVIDIA`.
+- Chinese numerals become digits when they are clearly numbers, for example `RTX 五零八零` → `RTX 5080`, `十六 GB` → `16 GB`, `百分之二十` → `20%`; counting words such as `一個` stay as they are.
+
+Single words can be fixed with the replacement table `data\taiwan-lexicon.txt` (one "model output, Tab, replacement" per line); by default it maps a few mainland terms to their Taiwanese equivalents.
+
+### Punctuation (whisper models)
+
+Breeze-ASR-25 hardly outputs punctuation, but its segments end at clause boundaries, so the gateway adds it: a question particle at the end gets "？"; a pause of 0.7 s or more, a next segment that opens with a connective such as "另外" (also) or "最後" (finally), or the last segment gets "。"; everything else gets "，". The Qwen3-ASR family punctuates by itself.
+
+## Config file `gateway.config.json`
+
+| Key | Meaning |
+|---|---|
+| `port` / `backendPort` | 8790 for clients / 8791 internal |
+| `listen` | `"auto"` = 127.0.0.1 plus (with remote access on) every private IPv4 address of this PC; or an array of addresses |
+| `remoteInterfaces` | Regular expression on adapter names, empty = all (e.g. `zerotier|tailscale`) |
+| `allowCidrs` | `"auto"` = the subnets of those adapters; or an array of CIDRs |
+| `device` | `gpu:N` (CUDA, NVIDIA card N), `vulkan` (automatic), `vulkan:<card name>`, `cpu`. The default `gpu:0` uses the CUDA build on the first NVIDIA card when it is installed, otherwise Vulkan, otherwise the CPU |
+| `allowRemote`, `idleMinutes`, `modelFile`, `punctuation`, `convertSimplified`, `uiLanguage`, `vramGuard` | Written by the tray menu |
+| `vramGuardProcess`, `vramGuardMinFree` | The two yield thresholds: a number = MiB, a string such as `"15%"` = share of the card (defaults 2048, 1024) |
+| `vramGuardResumeSeconds` | Seconds to wait after the program exits before using the GPU again (default 60) |
+| `vramGuardWhitelist` | Program names (without .exe) that never cause a yield, written by the VRAM window; empty by default |
+| `vramGuardIgnore` | Advanced: a regular expression of programs to ignore, in addition to the whitelist |
+| `vramGuardCpuModel` | Model file for the CPU while the GPU is yielded; `""` = keep the configured one |
+| `builtinVocabulary` | `false` = do not send the built-in terms |
+| `language` | Recognition language when OpenWhispr sends none (`zh`, `en`, `auto`…) |
+| `prompt` | Prompt for whisper models only |
+| `llamaInstruction` | Instruction for the Qwen3-ASR family (first line of the system prompt) |
+| `llamaMode` | `chat` (default, sends the vocabulary hints) or `transcriptions` |
+| `llamaContext`, `llamaMaxTokens` | llama-server context length (default 8192) and output limit per request (default 2048) |
+| `modelsDir`, `engineDir`, `dataDir`, `tmpDir` | Relative paths are relative to this folder |
+
+While it runs, only the gateway writes this file. To edit it by hand, choose "Quit" first; with "Start at sign-in" on, Task Scheduler starts the app again within 5 minutes, so finish the edit before then or turn that option off. `/control/*` (the tray's local control API) accepts calls from this PC only. `gateway.log` records times, client IPs and durations, never what was said.
+
+## Build from source
+
+- `powershell -ExecutionPolicy Bypass -File build.ps1` builds `WhisprGateway.exe` from `src\GatewayTray.cs` with the C# compiler that ships with Windows (.NET Framework 4, no SDK); `whisper-gateway.js` runs as is.
+- If the app runs under "Start at sign-in", run `schtasks /Change /TN WhisprGateway /DISABLE` and quit it before rebuilding, then `/ENABLE` and `/Run` afterwards.
+- `WhisprGateway.exe --render-guard file.png --sample --lang en` draws the VRAM window into an image for layout checks.
+- `tools\` (in the source only, not in the release zip) holds test and monitoring scripts; `bash tools/watch-guard.sh` shows the yield decisions live and needs Git Bash, Python and curl.
+
+## Other notes
+
+- Self-hosted mode has no live transcription preview, and OpenWhispr's custom dictionary is not sent (use the vocabulary hints instead).
+- Windows only; "start with Windows" means at sign-in.
+
+## Thanks
+
+[OpenWhispr](https://github.com/OpenWhispr/openwhispr), [llama.cpp](https://github.com/ggml-org/llama.cpp), [whisper.cpp](https://github.com/ggml-org/whisper.cpp), [Qwen3-ASR](https://github.com/QwenLM/Qwen3-ASR), [TEA-ASR by JacobLinCool](https://huggingface.co/JacobLinCool/TEA-ASR-1.1), [GGUF quantizations by mradermacher](https://huggingface.co/mradermacher/TEA-ASR-1.1-GGUF), [MediaTek Research Breeze-ASR-25](https://huggingface.co/MediaTek-Research/Breeze-ASR-25), [ggml conversion by shdennlin](https://huggingface.co/shdennlin/breeze-asr-25-ggml), [OpenCC](https://github.com/BYVoid/OpenCC).

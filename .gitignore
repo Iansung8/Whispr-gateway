@@ -4,6 +4,7 @@ gateway.log*
 
 # large / third-party files are never committed - see README "相依項目"
 models/*.bin
+models/*.gguf
 engine/
 runtime/
 

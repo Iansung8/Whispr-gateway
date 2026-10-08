@@ -1,5 +1,8 @@
 # OpenWhispr 1.9.1 行為筆記（讀原始碼＋實測）
 
+> **English summary.** Notes on OpenWhispr 1.9.1, read from its `app.asar` and checked on Windows 11; not official documentation. Its local mode has six fixed Whisper slots and keeps `whisper-server` running for as long as the app runs, with no idle unload. A failed CUDA start sets `WHISPER_GPU_FAILED=cuda` in `.env`, and that flag keeps the app on the CPU until the GPU engine is retried or reinstalled, which laptops that power the dGPU off run into easily; the Vulkan engine re-pins the discrete GPU by itself. Self-hosted mode posts `multipart/form-data` (`file`, `model`, `language`) to `{endpoint}/audio/transcriptions`, sends no prompt (so the in-app dictionary does nothing), and allows plain `http://` only for private addresses. Choosing "Chinese (Traditional)" runs every result through OpenCC cn→twp, which also swaps vocabulary (數據→資料, 參數→引數 …); Transcription language "Auto" plus Chinese script "Keep as transcribed" avoids it.
+
+
 做這個閘道時從 OpenWhispr 的 `app.asar` 讀到、並在 Windows 11 上驗證過的行為。版本不同請自行再確認；這些都不是官方文件。
 
 ## 本機 Whisper 模型
